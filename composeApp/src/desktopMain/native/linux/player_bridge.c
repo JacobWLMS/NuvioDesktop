@@ -722,13 +722,20 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
         if (task->nheaders > 0 && task->headers) {
             size_t len = 0;
             for (int i = 0; i < task->nheaders; i++)
-                if (task->headers[i]) len += strlen(task->headers[i]) + 1;
+                if (task->headers[i]) len += strlen(task->headers[i]) * 2 + 2;
             if (len > 0) {
                 char *hdr = malloc(len + 1);
                 hdr[0] = '\0';
                 for (int i = 0; i < task->nheaders; i++) {
-                    if (i > 0 && task->headers[i]) strcat(hdr, "\n");
-                    if (task->headers[i]) strcat(hdr, task->headers[i]);
+                    if (!task->headers[i]) continue;
+                    if (hdr[0] != '\0') strcat(hdr, ",");
+                    const char *src = task->headers[i];
+                    char *dst = hdr + strlen(hdr);
+                    while (*src) {
+                        if (*src == '\\' || *src == ',') *dst++ = '\\';
+                        *dst++ = *src++;
+                    }
+                    *dst = '\0';
                 }
                 mpv_set_property_string(task->mpv, "http-header-fields", hdr);
                 free(hdr);
@@ -762,15 +769,25 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
     mpv_set_option_string(task->mpv, "keep-open", "no");
 
     if (task->nheaders > 0 && task->headers) {
+        /* mpv parses http-header-fields as comma-separated list.
+         * Escape backslashes and commas in header values to prevent splitting. */
         size_t len = 0;
         for (int i = 0; i < task->nheaders; i++)
-            if (task->headers[i]) len += strlen(task->headers[i]) + 1;
+            if (task->headers[i]) len += strlen(task->headers[i]) * 2 + 2;
         if (len > 0) {
             char *hdr = malloc(len + 1);
             hdr[0] = '\0';
             for (int i = 0; i < task->nheaders; i++) {
-                if (i > 0 && task->headers[i]) strcat(hdr, "\n");
-                if (task->headers[i]) strcat(hdr, task->headers[i]);
+                if (!task->headers[i]) continue;
+                if (hdr[0] != '\0') strcat(hdr, ",");
+                /* Escape \ and , in each header line */
+                const char *src = task->headers[i];
+                char *dst = hdr + strlen(hdr);
+                while (*src) {
+                    if (*src == '\\' || *src == ',') *dst++ = '\\';
+                    *dst++ = *src++;
+                }
+                *dst = '\0';
             }
             mpv_set_option_string(task->mpv, "http-header-fields", hdr);
             free(hdr);
