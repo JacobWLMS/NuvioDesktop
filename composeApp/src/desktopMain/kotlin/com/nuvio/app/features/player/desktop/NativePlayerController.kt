@@ -28,7 +28,7 @@ import javax.swing.SwingUtilities
 import kotlin.concurrent.Volatile
 
 internal class NativePlayerController(
-    private val host: NativePlayerHost,
+    private val host: PlayerHost,
 ) : PlayerEngineController {
     private companion object {
         val json = Json { ignoreUnknownKeys = true }
@@ -44,8 +44,18 @@ internal class NativePlayerController(
     private var onScrubChange: (Long) -> Boolean = { false }
     private var onScrubFinished: (Long) -> Boolean = { false }
     private val eventSink = NativePlayerEventSink { type, value ->
-        SwingUtilities.invokeLater {
+        if (DesktopHostOs.current == DesktopHostOs.LINUX) {
             handlePlayerEvent(type, value)
+        } else {
+            SwingUtilities.invokeLater {
+                handlePlayerEvent(type, value)
+            }
+        }
+    }
+
+    init {
+        host.onMouseClick = {
+            onAction(PlayerControlsAction.ToggleChrome)
         }
     }
 
@@ -54,8 +64,8 @@ internal class NativePlayerController(
         sourceHeaders: Map<String, String>,
         playWhenReady: Boolean,
         initialPositionMs: Long,
-        decoderPriority: Int,
-        nvidiaRtxSuperResolutionEnabled: Boolean,
+        decoderPriority: Int = 0,
+        nvidiaRtxSuperResolutionEnabled: Boolean = false,
         onError: (String?) -> Unit,
     ) {
         val pending = PendingSource(
@@ -68,47 +78,94 @@ internal class NativePlayerController(
             onError = onError,
         )
         pendingSource = pending
-        host.onPeerReady = { attachPending() }
-        if (host.isDisplayable) {
+
+        if (host is NativePlayerHost) {
+            val nativeHost = host as NativePlayerHost
+            nativeHost.onPeerReady = { attachPending() }
+            if (nativeHost.isDisplayable) {
+                attachPending()
+            }
+        } else {
+            // WaylandPlayerHost — no AWT peer needed
             attachPending()
         }
     }
 
     private fun attachPending() {
         val pending = pendingSource ?: return
-        SwingUtilities.invokeLater {
-            if (!host.isDisplayable) {
-                return@invokeLater
-            }
-            disposePlayerHandle()
-            runCatching {
-                val hostViewPtr = AwtNativeViewResolver.resolveNativeViewPointer(host)
-                val resolvedSource = if (pending.sourceUrl.startsWith("file:", ignoreCase = true)) {
-                    runCatching { java.io.File(java.net.URI(pending.sourceUrl)).absolutePath }.getOrElse {
-                        val stripped = pending.sourceUrl.replaceFirst(Regex("^file:/{1,3}", RegexOption.IGNORE_CASE), "")
-                        runCatching { java.net.URLDecoder.decode(stripped, "UTF-8") }.getOrDefault(stripped)
-                    }
-                } else {
-                    pending.sourceUrl
+
+        if (host is NativePlayerHost) {
+            val nativeHost = host as NativePlayerHost
+            SwingUtilities.invokeLater {
+                if (!nativeHost.isDisplayable) {
+                    return@invokeLater
                 }
-                handle = NativePlayerBridge.create(
-                    hostViewPtr = hostViewPtr,
-                    sourceUrl = resolvedSource,
-                    headerLines = pending.headerLines.toTypedArray(),
-                    playWhenReady = pending.playWhenReady,
-                    initialPositionMs = pending.initialPositionMs,
-                    controlsPageUrl = NativePlayerBridge.controlsPageUrl,
-                    decoderPriority = pending.decoderPriority,
-                    nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
-                    eventSink = eventSink,
-                )
-                if (handle == 0L) error("Native player did not return a handle.")
-                updateControls(controlsState)
-            }.onFailure { error ->
-                pending.onError(error.message)
+                attachPendingAwt(pending, nativeHost)
             }
+        } else {
+            attachPendingDirect(pending)
         }
     }
+
+    private fun attachPendingAwt(pending: PendingSource, nativeHost: NativePlayerHost) {
+        disposePlayerHandle()
+        runCatching {
+            val hostViewPtr = AwtNativeViewResolver.resolveNativeViewPointer(nativeHost)
+            val resolvedSource = resolveSourceUrl(pending.sourceUrl)
+            handle = NativePlayerBridge.create(
+                hostViewPtr = hostViewPtr,
+                sourceUrl = resolvedSource,
+                headerLines = pending.headerLines.toTypedArray(),
+                playWhenReady = pending.playWhenReady,
+                initialPositionMs = pending.initialPositionMs,
+                controlsPageUrl = NativePlayerBridge.controlsPageUrl,
+                decoderPriority = pending.decoderPriority,
+                nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
+                eventSink = eventSink,
+            )
+            if (handle == 0L) error("Native player did not return a handle.")
+            nativeHost.nativeHandle = handle
+            nativeHost.onResize = { w, h ->
+                NativePlayerBridge.resizeNativeView(handle, w, h)
+            }
+            updateControls(controlsState)
+        }.onFailure { error ->
+            pending.onError(error.message)
+        }
+    }
+
+    private fun attachPendingDirect(pending: PendingSource) {
+        disposePlayerHandle()
+        runCatching {
+            val resolvedSource = resolveSourceUrl(pending.sourceUrl)
+            handle = NativePlayerBridge.create(
+                hostViewPtr = 0L,
+                sourceUrl = resolvedSource,
+                headerLines = pending.headerLines.toTypedArray(),
+                playWhenReady = pending.playWhenReady,
+                initialPositionMs = pending.initialPositionMs,
+                controlsPageUrl = "",
+                decoderPriority = pending.decoderPriority,
+                nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
+                eventSink = eventSink,
+            )
+            if (handle == 0L) error("Native player did not return a handle.")
+            host.nativeHandle = handle
+            updateControls(controlsState)
+        }.onFailure { error ->
+            pending.onError(error.message)
+        }
+    }
+
+    private fun resolveSourceUrl(sourceUrl: String): String =
+        if (sourceUrl.startsWith("file:", ignoreCase = true)) {
+            runCatching { java.io.File(java.net.URI(sourceUrl)).absolutePath }.getOrElse {
+                val stripped = sourceUrl.replaceFirst(Regex("^file:/{1,3}", RegexOption.IGNORE_CASE), "")
+                runCatching { java.net.URLDecoder.decode(stripped, "UTF-8") }.getOrDefault(stripped)
+            }
+        } else {
+            sourceUrl
+        }
 
     fun setControlCallbacks(
         onAction: (PlayerControlsAction) -> Boolean,
@@ -138,7 +195,9 @@ internal class NativePlayerController(
             state
         }
         controlsState = stateWithVolume
-        val isFullscreen = isDesktopAppFullscreen(SwingUtilities.getWindowAncestor(host))
+        val isFullscreen = (host as? java.awt.Component)?.let {
+            isDesktopAppFullscreen(SwingUtilities.getWindowAncestor(it))
+        } ?: false
         val structureKey = NativeControlsStructureKey(
             state = stateWithVolume.nativeControlsStructureKey(),
             isFullscreen = isFullscreen,
@@ -177,7 +236,10 @@ internal class NativePlayerController(
                 }
             }
             "toggleFullscreen" -> {
-                toggleDesktopAppFullscreen(SwingUtilities.getWindowAncestor(host))
+                val window = (host as? java.awt.Component)?.let {
+                    SwingUtilities.getWindowAncestor(it)
+                }
+                toggleDesktopAppFullscreen(window)
                 lastSentControlsStructureKey = null
                 updateControls(controlsState)
             }
@@ -287,6 +349,7 @@ internal class NativePlayerController(
     private fun disposePlayerHandle() {
         val current = handle
         handle = 0L
+        host.nativeHandle = 0L
         lastSentControlsStructureKey = null
         if (current != 0L) {
             runCatching { NativePlayerBridge.dispose(current) }
