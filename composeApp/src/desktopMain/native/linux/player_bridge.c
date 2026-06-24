@@ -277,7 +277,7 @@ static int initEGL_Wayland(CreateTask *task) {
 
     /* Open a DRM render node for VAAPI/nvdec interop (mpv DRM_DISPLAY_V2).
      * The EGL display is Wayland-based but mpv still needs a DRM fd for hw decode. */
-    if (task->gbmFd < 0) {
+    if (task->gbmFd <= 0) {
         static const char *drmNodes[] = {"/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130", NULL};
         for (int i = 0; drmNodes[i]; i++) {
             int fd = open(drmNodes[i], O_RDWR);
@@ -890,6 +890,11 @@ static int initEGL(CreateTask *task) {
     /* Clear any stale EGL thread state from Skia/Compose */
     eglReleaseThread();
 
+    /* Try Wayland EGL first (test) */
+    if (initEGL_Wayland(task)) {
+        return 1;
+    }
+
     /* Try render nodes — on multi-GPU systems, find one that works.
      * renderD128 may be AMD iGPU while renderD129 is NVIDIA dGPU. */
     static const char *renderNodes[] = {
@@ -1293,7 +1298,7 @@ static void *renderThreadFunc(void *data) {
             {MPV_RENDER_PARAM_ADVANCED_CONTROL, &advanced},
             {0}
         };
-        mpv_render_param *render_params = (task->gbmFd >= 0 && task->gbmDevice)
+        mpv_render_param *render_params = (task->gbmFd > 0)
             ? render_params_drm : render_params_nodrm;
 
         if (mpv_render_context_create(&task->renderCtx, task->mpv, render_params) < 0) {
