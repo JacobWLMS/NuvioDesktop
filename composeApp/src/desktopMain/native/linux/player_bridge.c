@@ -197,9 +197,158 @@ static int initEGL_NvidiaVendor(CreateTask *task) {
     PFN_eglReleaseThread nv_eglReleaseThread = (PFN_eglReleaseThread)dlsym(nvEGL, "eglReleaseThread");
 
     if (!nv_eglGetPlatformDisplay || !nv_eglInitialize || !nv_eglMakeCurrent || !nv_eglCreateContext) {
-        DBG("EGL: NVIDIA vendor lib missing required symbols\n");
+        DBG("EGL: NVIDIA vendor lib missing required symbols, trying GLVND dispatch override\n");
         dlclose(nvEGL);
-        return 0;
+
+        /* Alternative: set __EGL_VENDOR_LIBRARY_FILENAMES to force NVIDIA vendor in GLVND.
+         * Then use standard EGL functions which will be dispatched to NVIDIA. */
+        static const char *nvJsonPaths[] = {
+            "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+            "/usr/share/egl/egl_external_platform.d/10_nvidia.json",
+            "/etc/glvnd/egl_vendor.d/10_nvidia.json",
+            NULL
+        };
+        const char *nvJson = NULL;
+        for (int i = 0; nvJsonPaths[i]; i++) {
+            if (access(nvJsonPaths[i], R_OK) == 0) {
+                nvJson = nvJsonPaths[i];
+                break;
+            }
+        }
+        if (!nvJson) {
+            DBG("EGL: NVIDIA GLVND vendor JSON not found\n");
+            return 0;
+        }
+        DBG("EGL: overriding EGL vendor to: %s\n", nvJson);
+
+        /* Save and override */
+        const char *oldVendor = getenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+        char oldVendorBuf[512] = {0};
+        if (oldVendor) strncpy(oldVendorBuf, oldVendor, sizeof(oldVendorBuf)-1);
+        setenv("__EGL_VENDOR_LIBRARY_FILENAMES", nvJson, 1);
+
+        /* Now standard EGL calls should go through NVIDIA */
+        eglReleaseThread();
+
+        /* Open GBM device for NVIDIA render node */
+        int nvFd = -1;
+        static const char *renderNodes[] = {"/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130", NULL};
+        for (int i = 0; renderNodes[i]; i++) {
+            nvFd = open(renderNodes[i], O_RDWR);
+            if (nvFd >= 0) {
+                DBG("EGL: trying render node %s (fd=%d)\n", renderNodes[i], nvFd);
+                break;
+            }
+        }
+        if (nvFd < 0) {
+            DBG("EGL: no render node available\n");
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        struct gbm_device *gbmDev = gbm_create_device(nvFd);
+        if (!gbmDev) {
+            DBG("EGL: GBM device creation failed for NVIDIA override\n");
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatDisp =
+            (PFNEGLGETPLATFORMDISPLAYEXTPROC)(void*)eglGetProcAddress("eglGetPlatformDisplayEXT");
+        EGLDisplay display = EGL_NO_DISPLAY;
+        if (getPlatDisp) {
+            display = getPlatDisp(EGL_PLATFORM_GBM_KHR, gbmDev, NULL);
+        }
+        if (display == EGL_NO_DISPLAY) {
+            display = eglGetDisplay((EGLNativeDisplayType)gbmDev);
+        }
+        if (display == EGL_NO_DISPLAY) {
+            DBG("EGL: NVIDIA override display failed\n");
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        EGLint major, minor;
+        if (!eglInitialize(display, &major, &minor)) {
+            DBG("EGL: NVIDIA override eglInitialize failed\n");
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+        DBG("EGL: NVIDIA override initialized %d.%d\n", major, minor);
+
+        eglBindAPI(EGL_OPENGL_API);
+        EGLint configAttribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        EGLConfig config;
+        EGLint numConfigs;
+        if (!eglChooseConfig(display, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+            DBG("EGL: NVIDIA override config failed\n");
+            eglTerminate(display);
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                                EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                EGL_NONE };
+        EGLContext ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            EGLint ctxAttribs2[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+            ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs2);
+        }
+        if (ctx == EGL_NO_CONTEXT) {
+            DBG("EGL: NVIDIA override context failed\n");
+            eglTerminate(display);
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+        EGLSurface surface = eglCreatePbufferSurface(display, config, pbufAttribs);
+        EGLSurface testSurf = (surface != EGL_NO_SURFACE) ? surface : EGL_NO_SURFACE;
+
+        if (!eglMakeCurrent(display, testSurf, testSurf, ctx)) {
+            DBG("EGL: NVIDIA override eglMakeCurrent failed (err=0x%x)\n", eglGetError());
+            eglDestroyContext(display, ctx);
+            if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+            eglTerminate(display);
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        /* Success! */
+        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        task->eglDisplay = display;
+        task->eglContext = ctx;
+        task->eglSurface = surface;
+        task->gbmFd = nvFd;
+        task->gbmDevice = gbmDev;
+        DBG("EGL: NVIDIA GLVND override context ready (display=%p, surface=%s)\n",
+            (void*)display, surface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless");
+        /* Keep vendor override active for this process */
+        return 1;
     }
 
     if (nv_eglReleaseThread) nv_eglReleaseThread();
