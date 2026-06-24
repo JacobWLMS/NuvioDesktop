@@ -60,7 +60,6 @@ static struct {
     struct gbm_device *gbmDevice;
     EGLDisplay eglDisplay;
     EGLContext eglContext;
-    EGLSurface eglSurface;
     mpv_handle *mpv;
     mpv_render_context *renderCtx;
     GLuint fbo;
@@ -233,15 +232,8 @@ static int initEGL(CreateTask *task) {
         return 0;
     }
 
-    /* Try creating a 1x1 pbuffer surface — needed on NVIDIA where surfaceless fails */
-    EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
-    task->eglSurface = eglCreatePbufferSurface(task->eglDisplay, config, pbufAttribs);
-    if (task->eglSurface == EGL_NO_SURFACE) {
-        DBG("EGL: pbuffer creation failed (non-fatal, will try surfaceless)\n");
-        task->eglSurface = EGL_NO_SURFACE;
-    }
-    DBG("EGL: GBM context created successfully (surface=%s)\n",
-        task->eglSurface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless");
+    task->eglSurface = EGL_NO_SURFACE;
+    DBG("EGL: GBM context created successfully (will activate in render thread)\n");
     return 1;
 }
 
@@ -307,7 +299,7 @@ static void renderFrameGL(CreateTask *task) {
         h = (int)vh;
     }
 
-    if (!eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext)) {
+    if (!eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext)) {
         DBG("renderFrameGL: eglMakeCurrent failed (error=0x%x)\n", eglGetError());
         return;
     }
@@ -421,7 +413,7 @@ static void *renderThreadFunc(void *data) {
                 goto render_loop;
             }
         }
-        EGLBoolean mkRes = eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext);
+        EGLBoolean mkRes = eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext);
         DBG("render thread: eglMakeCurrent=%d (err=0x%x)\n", mkRes, mkRes ? 0 : eglGetError());
         if (mkRes) {
             const char *glVersion = (const char *)glGetString(GL_VERSION);
@@ -471,7 +463,7 @@ static void *renderThreadFunc(void *data) {
         }
     } else if (task->gpuMode == 2 && task->renderCtx) {
         /* Cached path: render context already exists, just activate EGL */
-        eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext);
+        eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext);
         mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
         DBG("render thread: reusing cached GL context\n");
     }
@@ -718,7 +710,6 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
                 task->gbmDevice = glCache.gbmDevice;
                 task->eglDisplay = glCache.eglDisplay;
                 task->eglContext = glCache.eglContext;
-                task->eglSurface = glCache.eglSurface;
                 task->fbo = glCache.fbo;
                 task->fboTex = glCache.fboTex;
                 task->fboW = glCache.fboW;
@@ -952,7 +943,6 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
         glCache.gbmDevice = task->gbmDevice;
         glCache.eglDisplay = task->eglDisplay;
         glCache.eglContext = task->eglContext;
-        glCache.eglSurface = task->eglSurface;
         glCache.mpv = task->mpv;
         glCache.renderCtx = task->renderCtx;
         glCache.fbo = task->fbo;
