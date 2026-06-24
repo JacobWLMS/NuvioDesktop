@@ -394,6 +394,25 @@ static void *renderThreadFunc(void *data) {
     /* If gpuMode==2, create GL render context here where we own the EGL context.
      * This allows mpv to see eglGetCurrentDisplay() and init VAAPI interop. */
     if (task->gpuMode == 2 && !task->renderCtx) {
+        /* Init EGL on this thread if not cached (NVIDIA requires same-thread create+MakeCurrent) */
+        if (task->eglDisplay == EGL_NO_DISPLAY) {
+            if (!initEGL(task)) {
+                DBG("render thread: initEGL FAILED, falling back to SW\n");
+                task->gpuMode = 0;
+                int adv = 1;
+                mpv_render_param sw_params[] = {
+                    {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_SW},
+                    {MPV_RENDER_PARAM_ADVANCED_CONTROL, &adv},
+                    {0}
+                };
+                mpv_render_context_create(&task->renderCtx, task->mpv, sw_params);
+                if (task->renderCtx) {
+                    mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
+                    mpv_set_property_string(task->mpv, "hwdec", "auto-copy");
+                }
+                goto render_loop;
+            }
+        }
         EGLBoolean mkRes = eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext);
         DBG("render thread: eglMakeCurrent=%d (err=0x%x)\n", mkRes, mkRes ? 0 : eglGetError());
         if (mkRes) {
@@ -449,6 +468,7 @@ static void *renderThreadFunc(void *data) {
         DBG("render thread: reusing cached GL context\n");
     }
 
+render_loop:
     while (task->alive) {
         pthread_mutex_lock(&task->frameMutex);
         while (!task->frameSignal && task->alive) {
@@ -682,7 +702,6 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
         }
     } else {
         /* GL offscreen with cached/new EGL display */
-        int eglOk = 0;
         if (detect_wayland()) {
             pthread_mutex_lock(&glCacheMutex);
             if (glCache.valid) {
@@ -705,20 +724,18 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
                 glCache.renderCtx = NULL;
                 pthread_mutex_unlock(&glCacheMutex);
                 task->gpuMode = 2;
-                eglOk = 1;
                 DBG("create: cached GL instance restored\n");
             } else {
                 pthread_mutex_unlock(&glCacheMutex);
-                eglOk = initEGL(task);
-                if (eglOk) {
-                    DBG("create: Wayland + EGL offscreen GL mode (fresh)\n");
-                    task->gpuMode = 2;
-                    mpv_set_option_string(task->mpv, "vo", "libmpv");
-                    mpv_set_option_string(task->mpv, "gpu-api", "opengl");
-                }
+                /* Defer EGL init to render thread — NVIDIA GBM/EGL doesn't support
+                 * context creation on one thread + MakeCurrent on another. */
+                task->gpuMode = 2;
+                mpv_set_option_string(task->mpv, "vo", "libmpv");
+                mpv_set_option_string(task->mpv, "gpu-api", "opengl");
+                DBG("create: Wayland mode, EGL deferred to render thread\n");
             }
         }
-        if (!eglOk) {
+        if (task->gpuMode != 2) {
             DBG("create: SW fallback mode\n");
             task->gpuMode = 0;
             mpv_set_option_string(task->mpv, "vo", "libmpv");
