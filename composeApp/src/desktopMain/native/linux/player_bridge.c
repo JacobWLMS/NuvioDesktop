@@ -394,8 +394,14 @@ static void *renderThreadFunc(void *data) {
     /* If gpuMode==2, create GL render context here where we own the EGL context.
      * This allows mpv to see eglGetCurrentDisplay() and init VAAPI interop. */
     if (task->gpuMode == 2 && !task->renderCtx) {
-        eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext);
-        DBG("render thread: EGL context activated, creating mpv GL render context\n");
+        EGLBoolean mkRes = eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext);
+        DBG("render thread: eglMakeCurrent=%d (err=0x%x)\n", mkRes, mkRes ? 0 : eglGetError());
+        if (mkRes) {
+            const char *glVersion = (const char *)glGetString(GL_VERSION);
+            const char *glRenderer = (const char *)glGetString(GL_RENDERER);
+            DBG("render thread: GL=%s renderer=%s\n", glVersion ? glVersion : "null", glRenderer ? glRenderer : "null");
+        }
+        DBG("render thread: creating mpv GL render context (gbmFd=%d)\n", task->gbmFd);
 
 
         mpv_opengl_init_params gl_init = {
@@ -666,10 +672,14 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
 
     /* -- GPU direct mode: vo=gpu-next with X11 wid -- */
     if (isGpuMode) {
+        DBG("create: GPU direct mode, wid=0x%lx\n", (unsigned long)hostViewPtr);
         mpv_set_option_string(task->mpv, "vo", "gpu-next");
         mpv_set_option_string(task->mpv, "gpu-api", "opengl");
         int64_t wid = (int64_t)hostViewPtr;
-        mpv_set_option(task->mpv, "wid", MPV_FORMAT_INT64, &wid);
+        int widResult = mpv_set_option(task->mpv, "wid", MPV_FORMAT_INT64, &wid);
+        if (widResult < 0) {
+            DBG("create: wid option failed: %s\n", mpv_error_string(widResult));
+        }
     } else {
         /* GL offscreen with cached/new EGL display */
         int eglOk = 0;
@@ -871,17 +881,19 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
 
 skip_init:
     if (task->sourceUrl) {
-        const char *cmd[] = {"loadfile", task->sourceUrl, NULL};
-        mpv_command_async(task->mpv, 0, cmd);
+        if (initialPositionMs > 0) {
+            char startOpt[80];
+            snprintf(startOpt, sizeof(startOpt), "start=%f", (double)initialPositionMs / 1000.0);
+            const char *cmd[] = {"loadfile", task->sourceUrl, "replace", "0", startOpt, NULL};
+            mpv_command_async(task->mpv, 0, cmd);
+        } else {
+            const char *cmd[] = {"loadfile", task->sourceUrl, "replace", NULL};
+            mpv_command_async(task->mpv, 0, cmd);
+        }
     }
 
     if (!playWhenReady) {
         mpv_set_property_string(task->mpv, "pause", "yes");
-    }
-    if (initialPositionMs > 0) {
-        char posStr[64];
-        snprintf(posStr, sizeof(posStr), "%f", (double)initialPositionMs / 1000.0);
-        mpv_set_property_string(task->mpv, "time-pos", posStr);
     }
 
     DBG("create: returning handle (gpuMode=%d)\n", task->gpuMode);

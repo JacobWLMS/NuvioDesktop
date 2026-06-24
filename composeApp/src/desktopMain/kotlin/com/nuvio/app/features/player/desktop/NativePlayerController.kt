@@ -109,8 +109,10 @@ internal class NativePlayerController(
 
     private fun attachPendingAwt(pending: PendingSource, nativeHost: NativePlayerHost) {
         disposePlayerHandle()
+        System.err.println("[NUVIO_ATTACH] attachPendingAwt: resolving view pointer...")
         runCatching {
             val hostViewPtr = AwtNativeViewResolver.resolveNativeViewPointer(nativeHost)
+            System.err.println("[NUVIO_ATTACH] hostViewPtr=0x${hostViewPtr.toString(16)}, calling create()")
             val resolvedSource = resolveSourceUrl(pending.sourceUrl)
             handle = NativePlayerBridge.create(
                 hostViewPtr = hostViewPtr,
@@ -123,6 +125,7 @@ internal class NativePlayerController(
                 nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
                 eventSink = eventSink,
             )
+            System.err.println("[NUVIO_ATTACH] create() returned handle=$handle")
             if (handle == 0L) error("Native player did not return a handle.")
             nativeHost.nativeHandle = handle
             nativeHost.onResize = { w, h ->
@@ -130,6 +133,7 @@ internal class NativePlayerController(
             }
             updateControls(controlsState)
         }.onFailure { error ->
+            System.err.println("[NUVIO_ATTACH] attachPendingAwt FAILED: ${error.message}")
             pending.onError(error.message)
         }
     }
