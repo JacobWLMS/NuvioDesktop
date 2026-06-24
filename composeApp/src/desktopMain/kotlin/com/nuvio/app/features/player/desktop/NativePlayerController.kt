@@ -86,7 +86,7 @@ internal class NativePlayerController(
                 attachPending()
             }
         } else {
-            // WaylandPlayerHost — no AWT peer needed
+            // LinuxPlayerHost — no AWT peer needed
             attachPending()
         }
     }

@@ -13,7 +13,6 @@
 #include <locale.h>
 #include <unistd.h>
 #include <stdarg.h>
-#include <dlfcn.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #define GL_GLEXT_PROTOTYPES
@@ -21,36 +20,6 @@
 #include <GL/glext.h>
 #include <fcntl.h>
 #include <gbm.h>
-
-/* JAWT: loaded dynamically at runtime (symbols available in JVM process) */
-#include <jawt.h>
-#include <jawt_md.h>
-
-/* JAWT function pointer — resolved via dlsym at runtime */
-typedef jboolean (*JAWT_GetAWT_t)(JNIEnv*, JAWT*);
-static JAWT_GetAWT_t resolve_JAWT_GetAWT(void) {
-    /* First try: symbol already in process (JVM exports it) */
-    void *sym = dlsym(RTLD_DEFAULT, "JAWT_GetAWT");
-    if (sym) return (JAWT_GetAWT_t)sym;
-    /* Second try: load libjawt.so from JAVA_HOME */
-    const char *java_home = getenv("JAVA_HOME");
-    if (java_home) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/lib/libjawt.so", java_home);
-        void *lib = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
-        if (lib) {
-            sym = dlsym(lib, "JAWT_GetAWT");
-            if (sym) return (JAWT_GetAWT_t)sym;
-        }
-    }
-    /* Third try: system path */
-    void *lib = dlopen("libjawt.so", RTLD_NOW | RTLD_GLOBAL);
-    if (lib) {
-        sym = dlsym(lib, "JAWT_GetAWT");
-        if (sym) return (JAWT_GetAWT_t)sym;
-    }
-    return NULL;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Debug logging                                                      */
@@ -64,21 +33,6 @@ __attribute__((constructor))
 static void on_load(void) {
     fprintf(stderr, "[player_bridge] CONSTRUCTOR: .so loaded (built %s %s)\n",
             __DATE__, __TIME__);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Wayland detection                                                  */
-/* ------------------------------------------------------------------ */
-static int detect_wayland(void) {
-    const char *session_type = getenv("XDG_SESSION_TYPE");
-    if (session_type && strstr(session_type, "wayland")) {
-        return 1;
-    }
-    const char *display = getenv("WAYLAND_DISPLAY");
-    if (display && display[0] != '\0') {
-        return 1;
-    }
-    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -112,7 +66,7 @@ typedef struct {
     char **headers;
     int nheaders;
     volatile int alive;
-    int gpuMode; /* 0 = SW rendering, 1 = vo=gpu-next with X11 wid, 2 = GL offscreen (Wayland) */
+    int gpuMode; /* 0 = SW rendering, 2 = GL offscreen (EGL FBO) */
 
     /* SW mode (gpuMode 0) */
     pthread_t renderThread;
@@ -141,6 +95,9 @@ typedef struct {
     GLuint fboTex;
     int fboW;
     int fboH;
+
+    /* Captured from JNI thread for shared context fallback (NVIDIA) */
+    EGLDisplay skiaDisplay;
 } CreateTask;
 
 static void callEventSink(JNIEnv *env, JavaVM *jvm,
@@ -184,6 +141,111 @@ typedef EGLDisplay (*PFNEGLGETPLATFORMDISPLAYEXTPROC)(EGLenum, void *, const EGL
 #ifndef EGL_EXT_device_enumeration
 typedef EGLBoolean (*PFNEGLQUERYDEVICESEXTPROC)(EGLint, void *, EGLint *);
 #endif
+
+/* ------------------------------------------------------------------ */
+/*  EGL shared context (piggyback on Skia/Compose's EGLDisplay)        */
+/* ------------------------------------------------------------------ */
+static int initEGL_SharedContext(CreateTask *task) {
+    DBG("EGL: trying shared context with Skia's EGLDisplay\n");
+
+    /* Use the display captured from JNI thread (where Skia may have been active) */
+    EGLDisplay skiaDisplay = task->skiaDisplay;
+
+    DBG("EGL: skiaDisplay=%p (captured from JNI thread)\n", (void*)skiaDisplay);
+
+    if (skiaDisplay == EGL_NO_DISPLAY) {
+        /* Last resort: try default display */
+        skiaDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (skiaDisplay == EGL_NO_DISPLAY) {
+            DBG("EGL: no usable display found for shared context\n");
+            return 0;
+        }
+    }
+
+    /* Ensure it's initialized (idempotent if already initialized by Skia) */
+    EGLint major, minor;
+    if (!eglInitialize(skiaDisplay, &major, &minor)) {
+        DBG("EGL: shared display init failed\n");
+        return 0;
+    }
+    DBG("EGL: shared display initialized %d.%d\n", major, minor);
+
+    task->eglDisplay = skiaDisplay;
+
+    /* Bind GL API (Skia may use GLES — try GL first, fallback GLES) */
+    eglBindAPI(EGL_OPENGL_API);
+
+    EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs;
+    int useGLES = 0;
+    if (!eglChooseConfig(task->eglDisplay, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+        DBG("EGL: shared GL config failed, trying GLES\n");
+        eglBindAPI(EGL_OPENGL_ES_API);
+        EGLint glesAttribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(task->eglDisplay, glesAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+            DBG("EGL: shared context: no suitable config\n");
+            task->eglDisplay = EGL_NO_DISPLAY;
+            return 0;
+        }
+        useGLES = 1;
+    }
+
+    /* Create context on the shared display — no share with Skia's context
+     * (we don't have access to it from render thread, but using the same
+     * display should bypass NVIDIA's multi-display restriction) */
+    EGLContext ctx = EGL_NO_CONTEXT;
+
+    if (!useGLES) {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                                EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                EGL_NONE };
+        ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            EGLint ctxAttribs2[] = { EGL_NONE };
+            ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs2);
+        }
+    } else {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+        ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
+    }
+
+    if (ctx == EGL_NO_CONTEXT) {
+        DBG("EGL: shared context creation failed (err=0x%x)\n", eglGetError());
+        task->eglDisplay = EGL_NO_DISPLAY;
+        return 0;
+    }
+    task->eglContext = ctx;
+    DBG("EGL: shared context created (api=%s)\n", useGLES ? "GLES" : "GL");
+
+    /* Create pbuffer surface */
+    EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    task->eglSurface = eglCreatePbufferSurface(task->eglDisplay, config, pbufAttribs);
+    if (task->eglSurface == EGL_NO_SURFACE) {
+        DBG("EGL: shared pbuffer failed, will use surfaceless\n");
+        task->eglSurface = EGL_NO_SURFACE;
+    }
+
+    /* DO NOT test eglMakeCurrent here — we're on the JNI thread where Skia's context
+     * may be active. The render thread will do MakeCurrent. Just verify context was created. */
+    DBG("EGL: shared context ready (display=%p, surface=%s)\n",
+        (void*)task->eglDisplay,
+        task->eglSurface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless");
+    return 1;
+}
 
 /* ------------------------------------------------------------------ */
 /*  EGL Device Platform fallback (headless, works on NVIDIA without    */
@@ -494,8 +556,8 @@ static int initEGL(CreateTask *task) {
     EGLSurface testSurf = (task->eglSurface != EGL_NO_SURFACE) ? task->eglSurface : EGL_NO_SURFACE;
     if (!eglMakeCurrent(task->eglDisplay, testSurf, testSurf, task->eglContext)) {
         EGLint err = eglGetError();
-        DBG("EGL: GBM eglMakeCurrent pre-check failed (err=0x%x), trying EGL Device Platform\n", err);
-        /* GBM path doesn't work (NVIDIA). Try EGL Device Platform instead. */
+        DBG("EGL: GBM eglMakeCurrent pre-check failed (err=0x%x), trying shared context\n", err);
+        /* GBM path doesn't work (NVIDIA). Try shared context with Skia's display first. */
         eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(task->eglDisplay, task->eglContext);
         if (task->eglSurface != EGL_NO_SURFACE) eglDestroySurface(task->eglDisplay, task->eglSurface);
@@ -507,6 +569,9 @@ static int initEGL(CreateTask *task) {
         task->eglSurface = EGL_NO_SURFACE;
         task->gbmDevice = NULL;
 
+        if (initEGL_SharedContext(task)) {
+            return 1;
+        }
         if (initEGL_DevicePlatform(task)) {
             return 1;
         }
@@ -964,22 +1029,29 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
     jobject eventSink) {
     (void)thiz;
     (void)decoderPriority; (void)nvidiaRtxSuperResolutionEnabled;
+    (void)hostViewPtr; /* gpuMode=1 (wid) removed — Linux always uses offscreen */
 
-    int isGpuMode = (hostViewPtr != 0);
-    DBG("create() called (%s mode)\n", isGpuMode ? "GPU (gpu-next + wid)" : "SW/GL offscreen");
+    DBG("create() called (offscreen GL/SW mode)\n");
 
     CreateTask *task = calloc(1, sizeof(CreateTask));
     if (!task) { DBG("create: calloc failed\n"); return 0; }
 
     (*env)->GetJavaVM(env, &task->jvm);
     task->alive = 1;
-    task->gpuMode = isGpuMode ? 1 : 0;
+    task->gpuMode = 0;
     task->eglDisplay = EGL_NO_DISPLAY;
 
-    if (!isGpuMode) {
-        pthread_mutex_init(&task->frameMutex, NULL);
-        pthread_cond_init(&task->frameCond, NULL);
+    /* Capture Skia/Compose's EGL display from JNI thread for shared context fallback.
+     * On NVIDIA, creating a new display fails but reusing Skia's works. */
+    task->skiaDisplay = eglGetCurrentDisplay();
+    if (task->skiaDisplay == EGL_NO_DISPLAY) {
+        /* Try default display — NVIDIA shares it process-wide */
+        task->skiaDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     }
+    DBG("create: captured skiaDisplay=%p\n", (void*)task->skiaDisplay);
+
+    pthread_mutex_init(&task->frameMutex, NULL);
+    pthread_cond_init(&task->frameCond, NULL);
 
     if (eventSink) {
         task->eventSink = (*env)->NewGlobalRef(env, eventSink);
@@ -1014,61 +1086,42 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
         free(task->sourceUrl);
         if (task->headers) { for (int i = 0; i < task->nheaders; i++) free(task->headers[i]); free(task->headers); }
         if (task->eventSink) (*env)->DeleteGlobalRef(env, task->eventSink);
-        if (!isGpuMode) pthread_mutex_destroy(&task->frameMutex);
+        pthread_mutex_destroy(&task->frameMutex);
         free(task);
         return 0;
     }
 
-    /* -- GPU direct mode: vo=gpu-next with X11 wid -- */
-    if (isGpuMode) {
-        DBG("create: GPU direct mode, wid=0x%lx\n", (unsigned long)hostViewPtr);
-        mpv_set_option_string(task->mpv, "vo", "gpu-next");
-        mpv_set_option_string(task->mpv, "gpu-api", "opengl");
-        int64_t wid = (int64_t)hostViewPtr;
-        int widResult = mpv_set_option(task->mpv, "wid", MPV_FORMAT_INT64, &wid);
-        if (widResult < 0) {
-            DBG("create: wid option failed: %s\n", mpv_error_string(widResult));
+    /* GL offscreen (both Wayland and X11 offscreen path) */
+    pthread_mutex_lock(&glCacheMutex);
+    if (glCache.valid) {
+        DBG("create: reusing cached GL instance\n");
+        task->gbmFd = glCache.gbmFd;
+        task->gbmDevice = glCache.gbmDevice;
+        task->eglDisplay = glCache.eglDisplay;
+        task->eglContext = glCache.eglContext;
+        task->fbo = glCache.fbo;
+        task->fboTex = glCache.fboTex;
+        task->fboW = glCache.fboW;
+        task->fboH = glCache.fboH;
+        if (glCache.mpv && glCache.renderCtx) {
+            mpv_terminate_destroy(task->mpv);
+            task->mpv = glCache.mpv;
+            task->renderCtx = glCache.renderCtx;
         }
+        glCache.valid = 0;
+        glCache.mpv = NULL;
+        glCache.renderCtx = NULL;
+        pthread_mutex_unlock(&glCacheMutex);
+        task->gpuMode = 2;
+        DBG("create: cached GL instance restored\n");
     } else {
-        /* GL offscreen with cached/new EGL display */
-        if (detect_wayland()) {
-            pthread_mutex_lock(&glCacheMutex);
-            if (glCache.valid) {
-                DBG("create: reusing cached GL instance\n");
-                task->gbmFd = glCache.gbmFd;
-                task->gbmDevice = glCache.gbmDevice;
-                task->eglDisplay = glCache.eglDisplay;
-                task->eglContext = glCache.eglContext;
-                task->fbo = glCache.fbo;
-                task->fboTex = glCache.fboTex;
-                task->fboW = glCache.fboW;
-                task->fboH = glCache.fboH;
-                if (glCache.mpv && glCache.renderCtx) {
-                    mpv_terminate_destroy(task->mpv);
-                    task->mpv = glCache.mpv;
-                    task->renderCtx = glCache.renderCtx;
-                }
-                glCache.valid = 0;
-                glCache.mpv = NULL;
-                glCache.renderCtx = NULL;
-                pthread_mutex_unlock(&glCacheMutex);
-                task->gpuMode = 2;
-                DBG("create: cached GL instance restored\n");
-            } else {
-                pthread_mutex_unlock(&glCacheMutex);
-                /* Defer EGL init to render thread — NVIDIA GBM/EGL doesn't support
-                 * context creation on one thread + MakeCurrent on another. */
-                task->gpuMode = 2;
-                mpv_set_option_string(task->mpv, "vo", "libmpv");
-                mpv_set_option_string(task->mpv, "gpu-api", "opengl");
-                DBG("create: Wayland mode, EGL deferred to render thread\n");
-            }
-        }
-        if (task->gpuMode != 2) {
-            DBG("create: SW fallback mode\n");
-            task->gpuMode = 0;
-            mpv_set_option_string(task->mpv, "vo", "libmpv");
-        }
+        pthread_mutex_unlock(&glCacheMutex);
+        /* Defer EGL init to render thread — NVIDIA GBM/EGL doesn't support
+         * context creation on one thread + MakeCurrent on another. */
+        task->gpuMode = 2;
+        mpv_set_option_string(task->mpv, "vo", "libmpv");
+        mpv_set_option_string(task->mpv, "gpu-api", "opengl");
+        DBG("create: offscreen GL mode, EGL deferred to render thread\n");
     }
 
     int reusingCachedMpv = (task->gpuMode == 2 && task->renderCtx != NULL);
@@ -1114,11 +1167,7 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
     mpv_set_option_string(task->mpv, "terminal", "no");
     mpv_set_option_string(task->mpv, "msg-level", "all=no");
 
-    if (task->gpuMode == 1) {
-        mpv_set_option_string(task->mpv, "hwdec", "auto");
-    } else {
-        mpv_set_option_string(task->mpv, "hwdec", "auto-copy");
-    }
+    mpv_set_option_string(task->mpv, "hwdec", "auto-copy");
 
     mpv_set_option_string(task->mpv, "vd-lavc-dr", "yes");
     mpv_set_option_string(task->mpv, "video-latency-hacks", "yes");
@@ -1157,16 +1206,14 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
         free(task->sourceUrl);
         if (task->headers) { for (int i = 0; i < task->nheaders; i++) free(task->headers[i]); free(task->headers); }
         if (task->eventSink) (*env)->DeleteGlobalRef(env, task->eventSink);
-        if (!isGpuMode) pthread_mutex_destroy(&task->frameMutex);
+        pthread_mutex_destroy(&task->frameMutex);
         if (task->gpuMode == 2) destroyEGL(task);
         free(task);
         return 0;
     }
 
     /* -- Create render context -- */
-    if (isGpuMode) {
-        DBG("create: GPU mode, mpv renders directly to X11 window 0x%lx\n", (unsigned long)hostViewPtr);
-    } else if (task->gpuMode == 2) {
+    if (task->gpuMode == 2) {
         /* Create render context on a dedicated thread where we can own EGL.
          * JNI thread has Skia's EGL active so eglMakeCurrent fails here.
          * We spawn render thread early, let it create the mpv render context
@@ -1199,29 +1246,27 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
 
     DBG("create: mpv initialized (gpuMode=%d)\n", task->gpuMode);
 
-    if (!isGpuMode) {
-        /* Start render thread FIRST — for gpuMode==2 it creates the GL render context */
-        pthread_create(&task->renderThread, NULL, renderThreadFunc, task);
+    /* Start render thread — for gpuMode==2 it creates the GL render context */
+    pthread_create(&task->renderThread, NULL, renderThreadFunc, task);
 
-        /* Wait for render thread to finish creating context (gpuMode==2) */
-        if (task->gpuMode == 2) {
-            /* Busy wait for renderCtx — render thread sets it quickly */
-            for (int i = 0; i < 500 && !task->renderCtx && task->alive; i++) {
-                usleep(2000); /* 2ms */
-            }
-            if (!task->renderCtx) {
-                DBG("create: render thread failed to create context, aborting\n");
-                task->alive = 0;
-                pthread_join(task->renderThread, NULL);
-                mpv_terminate_destroy(task->mpv);
-                callEventSink(env, task->jvm, task->eventSink, task->eventMethod, "error", 8.0);
-                free(task->sourceUrl);
-                if (task->headers) { for (int i = 0; i < task->nheaders; i++) free(task->headers[i]); free(task->headers); }
-                if (task->eventSink) (*env)->DeleteGlobalRef(env, task->eventSink);
-                pthread_mutex_destroy(&task->frameMutex);
-                free(task);
-                return 0;
-            }
+    /* Wait for render thread to finish creating context (gpuMode==2) */
+    if (task->gpuMode == 2) {
+        /* Busy wait for renderCtx — render thread sets it quickly */
+        for (int i = 0; i < 500 && !task->renderCtx && task->alive; i++) {
+            usleep(2000); /* 2ms */
+        }
+        if (!task->renderCtx) {
+            DBG("create: render thread failed to create context, aborting\n");
+            task->alive = 0;
+            pthread_join(task->renderThread, NULL);
+            mpv_terminate_destroy(task->mpv);
+            callEventSink(env, task->jvm, task->eventSink, task->eventMethod, "error", 8.0);
+            free(task->sourceUrl);
+            if (task->headers) { for (int i = 0; i < task->nheaders; i++) free(task->headers[i]); free(task->headers); }
+            if (task->eventSink) (*env)->DeleteGlobalRef(env, task->eventSink);
+            pthread_mutex_destroy(&task->frameMutex);
+            free(task);
+            return 0;
         }
     }
 
@@ -1255,9 +1300,7 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
     task->alive = 0;
     pthread_cond_signal(&task->frameCond);
 
-    if (task->gpuMode == 1) {
-        if (task->mpv) mpv_wakeup(task->mpv);
-    } else if (task->gpuMode == 2) {
+    if (task->gpuMode == 2) {
         if (task->mpv) {
             const char *cmd[] = {"stop", NULL};
             mpv_command(task->mpv, cmd);
@@ -1304,11 +1347,9 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
     }
     task->eventSink = NULL;
 
-    if (task->gpuMode != 1) {
-        pthread_mutex_lock(&task->frameMutex);
-        free(task->frameData); task->frameData = NULL;
-        pthread_mutex_unlock(&task->frameMutex);
-    }
+    pthread_mutex_lock(&task->frameMutex);
+    free(task->frameData); task->frameData = NULL;
+    pthread_mutex_unlock(&task->frameMutex);
 
     free(task->sourceUrl);
     if (task->headers) { for (int i = 0; i < task->nheaders; i++) free(task->headers[i]); free(task->headers); }
@@ -1320,12 +1361,6 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
 /* ------------------------------------------------------------------ */
 static CreateTask *getTask(jlong handle) {
     return handle ? (CreateTask *)(intptr_t)handle : NULL;
-}
-
-JNIEXPORT jboolean JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_isWaylandSession(
-    JNIEnv *env, jobject thiz) {
-    (void)env; (void)thiz;
-    return detect_wayland() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_updateControls(JNIEnv *env, jobject thiz, jlong handle, jstring json) {
@@ -1538,7 +1573,6 @@ JNIEXPORT jboolean JNICALL Java_com_nuvio_app_features_player_desktop_NativePlay
     (void)thiz;
     CreateTask *task = getTask(handle);
     if (!task || !task->alive) return JNI_FALSE;
-    if (task->gpuMode == 1) return JNI_FALSE;
 
     task->targetW = dstW;
     task->targetH = dstH;
@@ -1604,7 +1638,6 @@ JNIEXPORT jboolean JNICALL Java_com_nuvio_app_features_player_desktop_NativePlay
     (void)thiz;
     CreateTask *task = getTask(handle);
     if (!task || !task->alive) return JNI_FALSE;
-    if (task->gpuMode == 1) return JNI_FALSE;
 
     task->targetW = dstW;
     task->targetH = dstH;
@@ -1673,71 +1706,4 @@ JNIEXPORT jboolean JNICALL Java_com_nuvio_app_features_player_desktop_NativePlay
     (*env)->ReleaseByteArrayElements(env, dstBytes, dst, 0);
     pthread_mutex_unlock(&task->frameMutex);
     return JNI_TRUE;
-}
-
-
-/* ------------------------------------------------------------------ */
-/*  JAWT-based X11 Window ID resolution                                */
-/* ------------------------------------------------------------------ */
-JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_getX11WindowId(
-    JNIEnv *env, jobject thiz, jobject awtComponent) {
-    (void)thiz;
-
-    if (!awtComponent) {
-        DBG("getX11WindowId: awtComponent is null\n");
-        return 0;
-    }
-
-    JAWT_GetAWT_t jawt_GetAWT = resolve_JAWT_GetAWT();
-    if (!jawt_GetAWT) {
-        DBG("getX11WindowId: could not resolve JAWT_GetAWT symbol\n");
-        return 0;
-    }
-
-    JAWT awt;
-    awt.version = JAWT_VERSION_9;
-    if (!jawt_GetAWT(env, &awt)) {
-        /* Fallback to older JAWT version */
-        awt.version = JAWT_VERSION_1_4;
-        if (!jawt_GetAWT(env, &awt)) {
-            DBG("getX11WindowId: JAWT_GetAWT failed\n");
-            return 0;
-        }
-    }
-
-    JAWT_DrawingSurface *ds = awt.GetDrawingSurface(env, awtComponent);
-    if (!ds) {
-        DBG("getX11WindowId: GetDrawingSurface failed\n");
-        return 0;
-    }
-
-    jint lock = ds->Lock(ds);
-    if ((lock & JAWT_LOCK_ERROR) != 0) {
-        DBG("getX11WindowId: Lock failed\n");
-        awt.FreeDrawingSurface(ds);
-        return 0;
-    }
-
-    JAWT_DrawingSurfaceInfo *dsi = ds->GetDrawingSurfaceInfo(ds);
-    if (!dsi) {
-        DBG("getX11WindowId: GetDrawingSurfaceInfo failed\n");
-        ds->Unlock(ds);
-        awt.FreeDrawingSurface(ds);
-        return 0;
-    }
-
-    JAWT_X11DrawingSurfaceInfo *x11dsi = (JAWT_X11DrawingSurfaceInfo *)dsi->platformInfo;
-    jlong windowId = 0;
-    if (x11dsi) {
-        windowId = (jlong)x11dsi->drawable;
-        DBG("getX11WindowId: resolved X11 drawable=0x%lx\n", (unsigned long)windowId);
-    } else {
-        DBG("getX11WindowId: platformInfo is null (not X11?)\n");
-    }
-
-    ds->FreeDrawingSurfaceInfo(dsi);
-    ds->Unlock(ds);
-    awt.FreeDrawingSurface(ds);
-
-    return windowId;
 }

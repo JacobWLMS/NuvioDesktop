@@ -14,9 +14,6 @@ import java.awt.event.MouseMotionAdapter
 import java.awt.image.BufferedImage
 import javax.swing.Timer
 
-private val usesSoftwareRendering: Boolean
-    get() = DesktopHostOs.current == DesktopHostOs.LINUX && DesktopHostOs.isWayland
-
 internal class NativePlayerHost : Canvas(), PlayerHost {
     var onPeerReady: (() -> Unit)? = null
     var onDisplayableChanged: ((Boolean) -> Unit)? = null
@@ -31,39 +28,8 @@ internal class NativePlayerHost : Canvas(), PlayerHost {
     private var cursorVisible = true
     private var cursorHideTimer: Timer? = null
 
-    private var renderTimer: Timer? = null
-    private var pixelBuffer: IntArray? = null
-    private var frameImage: BufferedImage? = null
-
     @Volatile
     override var nativeHandle: Long = 0L
-        set(value) {
-            field = value
-            if (value != 0L && usesSoftwareRendering) {
-                startRenderTimer()
-            } else {
-                stopRenderTimer()
-            }
-        }
-
-    private fun startRenderTimer() {
-        if (renderTimer != null) return
-        renderTimer = Timer(33) {
-            if (nativeHandle != 0L && isDisplayable) {
-                repaint()
-            } else {
-                stopRenderTimer()
-            }
-        }.apply {
-            isRepeats = true
-            start()
-        }
-    }
-
-    private fun stopRenderTimer() {
-        renderTimer?.stop()
-        renderTimer = null
-    }
 
     private companion object {
         const val CursorIdleHideDelayMs = 3_000
@@ -124,9 +90,6 @@ internal class NativePlayerHost : Canvas(), PlayerHost {
     }
 
     override fun dispose() {
-        stopRenderTimer()
-        pixelBuffer = null
-        frameImage = null
         resetCursorVisibility()
     }
 
@@ -159,31 +122,8 @@ internal class NativePlayerHost : Canvas(), PlayerHost {
     }
 
     override fun paint(graphics: Graphics) {
-        val handle = nativeHandle
-        if (handle != 0L && usesSoftwareRendering && width > 0 && height > 0) {
-            val w = width
-            val h = height
-            var buf = pixelBuffer
-            if (buf == null || buf.size < w * h) {
-                buf = IntArray(w * h)
-                pixelBuffer = buf
-            }
-            if (NativePlayerBridge.renderFrame(handle, buf, w, h)) {
-                var img = frameImage
-                if (img == null || img.width != w || img.height != h) {
-                    img = BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB)
-                    frameImage = img
-                }
-                img.setRGB(0, 0, w, h, buf, 0, w)
-                graphics.drawImage(img, 0, 0, null)
-            } else {
-                graphics.color = Color.BLACK
-                graphics.fillRect(0, 0, w, h)
-            }
-        } else {
-            graphics.color = Color.BLACK
-            graphics.fillRect(0, 0, width, height)
-        }
+        graphics.color = Color.BLACK
+        graphics.fillRect(0, 0, width, height)
         if (!firstPaintNotified) {
             firstPaintNotified = true
             onFirstPaint?.invoke()
@@ -208,7 +148,6 @@ internal class NativePlayerHost : Canvas(), PlayerHost {
         onPeerReady = null
         onFirstPaint = null
         onFirstFullSizePaint = null
-        stopRenderTimer()
         resetCursorVisibility()
         super.removeNotify()
     }

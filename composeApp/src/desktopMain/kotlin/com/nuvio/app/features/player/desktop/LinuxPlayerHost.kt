@@ -12,14 +12,13 @@ import java.awt.image.BufferedImage
 import javax.swing.Timer
 
 /**
- * PlayerHost for Linux Wayland sessions where mpv cannot render directly
- * into an X11 window (no wid support). Instead, mpv renders offscreen
- * (EGL FBO via GBM) and this host pulls finished frames via
- * [NativePlayerBridge.renderFrameBytes] into a Skia [Image] that
- * Compose Canvas draws each tick. Double-buffered byte arrays avoid
+ * PlayerHost for Linux sessions (both Wayland and X11) where mpv renders
+ * offscreen (EGL FBO via GBM or SW fallback). This host pulls finished
+ * frames via [NativePlayerBridge.renderFrameBytes] into a Skia [Image]
+ * that Compose Canvas draws each tick. Double-buffered byte arrays avoid
  * per-frame allocation overhead.
  */
-internal class WaylandPlayerHost : PlayerHost {
+internal class LinuxPlayerHost : PlayerHost {
     @Volatile
     override var nativeHandle: Long = 0L
 

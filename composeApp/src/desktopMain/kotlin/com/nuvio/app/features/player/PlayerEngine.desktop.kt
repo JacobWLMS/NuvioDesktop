@@ -31,7 +31,7 @@ import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
 import com.nuvio.app.features.player.desktop.NativePlayerHost
-import com.nuvio.app.features.player.desktop.WaylandPlayerHost
+import com.nuvio.app.features.player.desktop.LinuxPlayerHost
 import com.nuvio.app.features.player.desktop.toggleDesktopAppFullscreen
 import java.awt.AWTEvent
 import java.awt.Toolkit
@@ -62,9 +62,12 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    if (DesktopHostOs.current == DesktopHostOs.LINUX && DesktopHostOs.isWayland) {
-        // Wayland: no wid support, must use SW rendering with Compose Canvas overlay
-        LinuxWaylandPlayerSurface(
+    if (DesktopHostOs.current == DesktopHostOs.LINUX) {
+        // Linux (both Wayland and X11): use offscreen rendering with Compose Canvas overlay.
+        // This ensures player controls render correctly on top of the video.
+        // On Wayland: EGL FBO via GBM (gpuMode=2) or SW fallback (gpuMode=0)
+        // On X11: same offscreen path — GPU decode via hwdec=auto-copy, Compose overlays controls.
+        LinuxPlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
             modifier = modifier,
@@ -80,7 +83,7 @@ actual fun PlatformPlayerSurface(
             onSnapshot = onSnapshot,
             onError = onError,
         )
-    } else if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS || DesktopHostOs.current == DesktopHostOs.LINUX) {
+    } else if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS) {
         // macOS, Windows, and Linux X11: GPU-direct rendering via native view pointer
         NativePlayerSurface(
             sourceUrl = sourceUrl,
@@ -108,11 +111,11 @@ actual fun PlatformPlayerSurface(
 }
 
 /**
- * Linux Wayland path: renders video frames in a Compose [Canvas] so controls overlay correctly.
- * mpv renders to EGL FBO (via GBM /dev/dri/renderD128), glReadPixels to byte[], Skia Image in Canvas.
+ * Linux path (Wayland + X11): renders video frames in a Compose [Canvas] so controls overlay correctly.
+ * mpv renders offscreen (EGL FBO via GBM or SW fallback), frames are pulled into Skia Image for Canvas.
  */
 @Composable
-private fun LinuxWaylandPlayerSurface(
+private fun LinuxPlayerSurface(
     sourceUrl: String,
     sourceHeaders: Map<String, String>,
     modifier: Modifier,
@@ -128,7 +131,7 @@ private fun LinuxWaylandPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    val host = remember { WaylandPlayerHost() }
+    val host = remember { LinuxPlayerHost() }
     val controller = remember(host) { NativePlayerController(host) }
     var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
     var frameTick by remember { mutableIntStateOf(0) }
