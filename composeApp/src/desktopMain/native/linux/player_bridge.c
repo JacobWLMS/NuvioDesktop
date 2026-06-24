@@ -232,11 +232,11 @@ static int initEGL_NvidiaVendor(CreateTask *task) {
 
         /* Open GBM device for NVIDIA render node */
         int nvFd = -1;
-        static const char *renderNodes[] = {"/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130", NULL};
-        for (int i = 0; renderNodes[i]; i++) {
-            nvFd = open(renderNodes[i], O_RDWR);
+        static const char *nvRenderNodes[] = {"/dev/dri/renderD129", "/dev/dri/renderD128", "/dev/dri/renderD130", NULL};
+        for (int i = 0; nvRenderNodes[i]; i++) {
+            nvFd = open(nvRenderNodes[i], O_RDWR);
             if (nvFd >= 0) {
-                DBG("EGL: trying render node %s (fd=%d)\n", renderNodes[i], nvFd);
+                DBG("EGL: trying render node %s (fd=%d)\n", nvRenderNodes[i], nvFd);
                 break;
             }
         }
@@ -737,25 +737,30 @@ static int initEGL(CreateTask *task) {
     /* Clear any stale EGL thread state from Skia/Compose */
     eglReleaseThread();
 
-    int origFd = open("/dev/dri/renderD128", O_RDWR);
-    if (origFd < 0) {
-        DBG("EGL: failed to open /dev/dri/renderD128\n");
-        return 0;
-    }
-    task->gbmFd = dup(origFd);
-    close(origFd);
-    if (task->gbmFd < 0) {
-        DBG("EGL: dup() failed\n");
-        return 0;
-    }
+    /* Try render nodes — on multi-GPU systems, find one that works.
+     * renderD128 may be AMD iGPU while renderD129 is NVIDIA dGPU. */
+    static const char *renderNodes[] = {
+        "/dev/dri/renderD128",
+        "/dev/dri/renderD129",
+        "/dev/dri/renderD130",
+        NULL
+    };
 
-    task->gbmDevice = gbm_create_device(task->gbmFd);
-    if (!task->gbmDevice) {
-        DBG("EGL: gbm_create_device failed\n");
-        close(task->gbmFd);
-        task->gbmFd = -1;
-        return 0;
-    }
+    for (int nodeIdx = 0; renderNodes[nodeIdx]; nodeIdx++) {
+        int origFd = open(renderNodes[nodeIdx], O_RDWR);
+        if (origFd < 0) continue;
+
+        task->gbmFd = dup(origFd);
+        close(origFd);
+        if (task->gbmFd < 0) continue;
+
+        task->gbmDevice = gbm_create_device(task->gbmFd);
+        if (!task->gbmDevice) {
+            close(task->gbmFd);
+            task->gbmFd = -1;
+            continue;
+        }
+        DBG("EGL: trying render node %s\n", renderNodes[nodeIdx]);
 
     PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
@@ -771,7 +776,8 @@ static int initEGL(CreateTask *task) {
         gbm_device_destroy(task->gbmDevice);
         close(task->gbmFd);
         task->gbmFd = -1;
-        return 0;
+        task->gbmDevice = NULL;
+        continue;
     }
 
     EGLint major, minor;
@@ -780,8 +786,9 @@ static int initEGL(CreateTask *task) {
         gbm_device_destroy(task->gbmDevice);
         close(task->gbmFd);
         task->gbmFd = -1;
+        task->gbmDevice = NULL;
         task->eglDisplay = EGL_NO_DISPLAY;
-        return 0;
+        continue;
     }
     DBG("EGL: initialized %d.%d via GBM\n", major, minor);
 
@@ -816,8 +823,9 @@ static int initEGL(CreateTask *task) {
             gbm_device_destroy(task->gbmDevice);
             close(task->gbmFd);
             task->gbmFd = -1;
+            task->gbmDevice = NULL;
             task->eglDisplay = EGL_NO_DISPLAY;
-            return 0;
+            continue;
         }
         useGLES = 1;
     }
@@ -842,8 +850,9 @@ static int initEGL(CreateTask *task) {
         gbm_device_destroy(task->gbmDevice);
         close(task->gbmFd);
         task->gbmFd = -1;
+        task->gbmDevice = NULL;
         task->eglDisplay = EGL_NO_DISPLAY;
-        return 0;
+        continue;
     }
     task->eglContext = ctx;
 
@@ -882,10 +891,10 @@ static int initEGL(CreateTask *task) {
         if (initEGL_DevicePlatform(task)) {
             return 1;
         }
-        /* Device platform also failed — give up */
+        /* All fallbacks failed for this node — try next */
         close(task->gbmFd);
         task->gbmFd = -1;
-        return 0;
+        continue;
     }
     /* Success — unbind for now, render thread will re-bind */
     eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -894,6 +903,11 @@ static int initEGL(CreateTask *task) {
         task->eglSurface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless",
         useGLES ? "GLES" : "GL");
     return 1;
+
+    } /* end for nodeIdx */
+
+    DBG("EGL: all render nodes exhausted\n");
+    return 0;
 }
 
 static void ensureFBO(CreateTask *task, int w, int h) {
