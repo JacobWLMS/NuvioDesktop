@@ -13,6 +13,7 @@
 #include <locale.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <dlfcn.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #define GL_GLEXT_PROTOTYPES
@@ -141,6 +142,160 @@ typedef EGLDisplay (*PFNEGLGETPLATFORMDISPLAYEXTPROC)(EGLenum, void *, const EGL
 #ifndef EGL_EXT_device_enumeration
 typedef EGLBoolean (*PFNEGLQUERYDEVICESEXTPROC)(EGLint, void *, EGLint *);
 #endif
+
+/* ------------------------------------------------------------------ */
+/*  EGL via NVIDIA vendor library (bypasses Mesa dispatcher)           */
+/* ------------------------------------------------------------------ */
+typedef EGLDisplay (*PFN_eglGetPlatformDisplay)(EGLenum, void*, const EGLint*);
+typedef EGLBoolean (*PFN_eglInitialize)(EGLDisplay, EGLint*, EGLint*);
+typedef EGLBoolean (*PFN_eglBindAPI)(EGLenum);
+typedef EGLBoolean (*PFN_eglChooseConfig)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*);
+typedef EGLContext (*PFN_eglCreateContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint*);
+typedef EGLSurface (*PFN_eglCreatePbufferSurface)(EGLDisplay, EGLConfig, const EGLint*);
+typedef EGLBoolean (*PFN_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+typedef EGLBoolean (*PFN_eglQueryDevicesEXT)(EGLint, EGLDeviceEXT*, EGLint*);
+typedef void* (*PFN_eglGetProcAddress)(const char*);
+typedef EGLint (*PFN_eglGetError)(void);
+typedef EGLBoolean (*PFN_eglReleaseThread)(void);
+
+static int initEGL_NvidiaVendor(CreateTask *task) {
+    /* Try to load NVIDIA's vendor-specific EGL library directly.
+     * This bypasses the Mesa GLVND dispatcher which may route to the wrong implementation. */
+    static const char *nvLibPaths[] = {
+        "libEGL_nvidia.so.0",
+        "libEGL_nvidia.so",
+        "/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.0",
+        "/usr/lib64/libEGL_nvidia.so.0",
+        NULL
+    };
+
+    void *nvEGL = NULL;
+    for (int i = 0; nvLibPaths[i]; i++) {
+        nvEGL = dlopen(nvLibPaths[i], RTLD_NOW);
+        if (nvEGL) {
+            DBG("EGL: loaded NVIDIA vendor library: %s\n", nvLibPaths[i]);
+            break;
+        }
+    }
+    if (!nvEGL) {
+        DBG("EGL: NVIDIA vendor library not found\n");
+        return 0;
+    }
+
+    /* Resolve EGL functions from NVIDIA library */
+    PFN_eglGetPlatformDisplay nv_eglGetPlatformDisplay =
+        (PFN_eglGetPlatformDisplay)dlsym(nvEGL, "eglGetPlatformDisplay");
+    PFN_eglInitialize nv_eglInitialize = (PFN_eglInitialize)dlsym(nvEGL, "eglInitialize");
+    PFN_eglBindAPI nv_eglBindAPI = (PFN_eglBindAPI)dlsym(nvEGL, "eglBindAPI");
+    PFN_eglChooseConfig nv_eglChooseConfig = (PFN_eglChooseConfig)dlsym(nvEGL, "eglChooseConfig");
+    PFN_eglCreateContext nv_eglCreateContext = (PFN_eglCreateContext)dlsym(nvEGL, "eglCreateContext");
+    PFN_eglCreatePbufferSurface nv_eglCreatePbufferSurface = (PFN_eglCreatePbufferSurface)dlsym(nvEGL, "eglCreatePbufferSurface");
+    PFN_eglMakeCurrent nv_eglMakeCurrent = (PFN_eglMakeCurrent)dlsym(nvEGL, "eglMakeCurrent");
+    PFN_eglQueryDevicesEXT nv_eglQueryDevicesEXT = (PFN_eglQueryDevicesEXT)dlsym(nvEGL, "eglQueryDevicesEXT");
+    PFN_eglGetProcAddress nv_eglGetProcAddress = (PFN_eglGetProcAddress)dlsym(nvEGL, "eglGetProcAddress");
+    PFN_eglGetError nv_eglGetError = (PFN_eglGetError)dlsym(nvEGL, "eglGetError");
+    PFN_eglReleaseThread nv_eglReleaseThread = (PFN_eglReleaseThread)dlsym(nvEGL, "eglReleaseThread");
+
+    if (!nv_eglGetPlatformDisplay || !nv_eglInitialize || !nv_eglMakeCurrent || !nv_eglCreateContext) {
+        DBG("EGL: NVIDIA vendor lib missing required symbols\n");
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    if (nv_eglReleaseThread) nv_eglReleaseThread();
+
+    /* Get NVIDIA EGL device and create platform display */
+    EGLDisplay display = EGL_NO_DISPLAY;
+
+    if (nv_eglQueryDevicesEXT) {
+        EGLDeviceEXT devices[4];
+        EGLint numDevices = 0;
+        if (nv_eglQueryDevicesEXT(4, devices, &numDevices) && numDevices > 0) {
+            /* EGL_PLATFORM_DEVICE_EXT through NVIDIA's own library */
+            display = nv_eglGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, devices[0], NULL);
+            DBG("EGL: NVIDIA vendor device display=%p (from %d devices)\n", (void*)display, numDevices);
+        }
+    }
+
+    if (display == EGL_NO_DISPLAY) {
+        /* Fallback to GBM platform through NVIDIA */
+        if (task->gbmDevice) {
+            display = nv_eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, task->gbmDevice, NULL);
+            DBG("EGL: NVIDIA vendor GBM display=%p\n", (void*)display);
+        }
+    }
+
+    if (display == EGL_NO_DISPLAY) {
+        DBG("EGL: NVIDIA vendor could not get display\n");
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    EGLint major, minor;
+    if (!nv_eglInitialize(display, &major, &minor)) {
+        DBG("EGL: NVIDIA vendor eglInitialize failed\n");
+        dlclose(nvEGL);
+        return 0;
+    }
+    DBG("EGL: NVIDIA vendor initialized %d.%d\n", major, minor);
+
+    if (nv_eglBindAPI) nv_eglBindAPI(EGL_OPENGL_API);
+
+    EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs;
+    if (!nv_eglChooseConfig(display, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+        DBG("EGL: NVIDIA vendor chooseConfig failed\n");
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                            EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                            EGL_NONE };
+    EGLContext ctx = nv_eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+    if (ctx == EGL_NO_CONTEXT) {
+        EGLint ctxAttribs2[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+        ctx = nv_eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs2);
+    }
+    if (ctx == EGL_NO_CONTEXT) {
+        DBG("EGL: NVIDIA vendor context creation failed (err=0x%x)\n", nv_eglGetError ? nv_eglGetError() : 0);
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    EGLSurface surface = nv_eglCreatePbufferSurface(display, config, pbufAttribs);
+    if (surface == EGL_NO_SURFACE) {
+        DBG("EGL: NVIDIA vendor pbuffer failed, trying surfaceless\n");
+        surface = EGL_NO_SURFACE;
+    }
+
+    /* Test MakeCurrent */
+    EGLSurface testSurf = (surface != EGL_NO_SURFACE) ? surface : EGL_NO_SURFACE;
+    if (!nv_eglMakeCurrent(display, testSurf, testSurf, ctx)) {
+        DBG("EGL: NVIDIA vendor eglMakeCurrent failed (err=0x%x)\n", nv_eglGetError ? nv_eglGetError() : 0);
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    /* Success! Unbind and store */
+    nv_eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    task->eglDisplay = display;
+    task->eglContext = ctx;
+    task->eglSurface = surface;
+    DBG("EGL: NVIDIA vendor context ready (display=%p, surface=%s)\n",
+        (void*)display, surface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless");
+
+    /* NOTE: we intentionally keep nvEGL handle open (leaked) — the display/context
+     * depend on this library being loaded for the process lifetime. */
+    return 1;
+}
 
 /* ------------------------------------------------------------------ */
 /*  EGL shared context (piggyback on Skia/Compose's EGLDisplay)        */
@@ -556,8 +711,8 @@ static int initEGL(CreateTask *task) {
     EGLSurface testSurf = (task->eglSurface != EGL_NO_SURFACE) ? task->eglSurface : EGL_NO_SURFACE;
     if (!eglMakeCurrent(task->eglDisplay, testSurf, testSurf, task->eglContext)) {
         EGLint err = eglGetError();
-        DBG("EGL: GBM eglMakeCurrent pre-check failed (err=0x%x), trying shared context\n", err);
-        /* GBM path doesn't work (NVIDIA). Try shared context with Skia's display first. */
+        DBG("EGL: GBM eglMakeCurrent pre-check failed (err=0x%x), trying NVIDIA vendor lib\n", err);
+        /* GBM path doesn't work (NVIDIA). Try NVIDIA vendor library directly. */
         eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(task->eglDisplay, task->eglContext);
         if (task->eglSurface != EGL_NO_SURFACE) eglDestroySurface(task->eglDisplay, task->eglSurface);
@@ -569,6 +724,9 @@ static int initEGL(CreateTask *task) {
         task->eglSurface = EGL_NO_SURFACE;
         task->gbmDevice = NULL;
 
+        if (initEGL_NvidiaVendor(task)) {
+            return 1;
+        }
         if (initEGL_SharedContext(task)) {
             return 1;
         }

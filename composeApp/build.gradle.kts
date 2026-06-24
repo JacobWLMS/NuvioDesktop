@@ -1256,6 +1256,7 @@ val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
             *cflags.split(" ").filter { it.isNotBlank() }.toTypedArray(),
             *libs.split(" ").filter { it.isNotBlank() }.toTypedArray(),
             "-lEGL", "-lGL", "-lgbm",
+            "-ldl",
             "-lm",
         )
     }
