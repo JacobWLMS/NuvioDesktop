@@ -29,6 +29,10 @@ internal class WaylandPlayerHost : PlayerHost {
     private var lastWidth = 0
     private var lastHeight = 0
 
+    /** Native video dimensions (from mpv dwidth/dheight), used for aspect ratio calculation. */
+    @Volatile var videoWidth: Int = 0
+    @Volatile var videoHeight: Int = 0
+
     /* Double-buffer: one being drawn by Compose, other being filled by native. */
     private var bufferA: ByteArray? = null
     private var bufferB: ByteArray? = null
@@ -44,6 +48,11 @@ internal class WaylandPlayerHost : PlayerHost {
     fun renderFrame(width: Int, height: Int): Boolean {
         val handle = nativeHandle
         if (handle == 0L || width <= 0 || height <= 0) return false
+
+        // Update video dimensions for aspect ratio calculations
+        val vw = NativePlayerBridge.videoWidth(handle)
+        val vh = NativePlayerBridge.videoHeight(handle)
+        if (vw > 0 && vh > 0) { videoWidth = vw; videoHeight = vh }
 
         val byteCount = width * height * 4
 

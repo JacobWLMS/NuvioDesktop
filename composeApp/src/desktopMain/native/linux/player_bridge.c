@@ -1174,6 +1174,18 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
     task->targetW = w; task->targetH = h;
 }
 
+JNIEXPORT jint JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_videoWidth(JNIEnv *env, jobject thiz, jlong hdl) {
+    (void)env; (void)thiz; CreateTask *task = getTask(hdl); if (!task || !task->mpv) return 0;
+    int64_t w = 0; mpv_get_property(task->mpv, "dwidth", MPV_FORMAT_INT64, &w);
+    return (jint)w;
+}
+
+JNIEXPORT jint JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_videoHeight(JNIEnv *env, jobject thiz, jlong hdl) {
+    (void)env; (void)thiz; CreateTask *task = getTask(hdl); if (!task || !task->mpv) return 0;
+    int64_t h = 0; mpv_get_property(task->mpv, "dheight", MPV_FORMAT_INT64, &h);
+    return (jint)h;
+}
+
 JNIEXPORT jboolean JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_renderFrame(
     JNIEnv *env, jobject thiz, jlong handle,
     jintArray dstPixels, jint dstW, jint dstH) {
