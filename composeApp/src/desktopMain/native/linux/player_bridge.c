@@ -875,13 +875,6 @@ static int initEGL(CreateTask *task) {
     /* Clear any stale EGL thread state from Skia/Compose */
     eglReleaseThread();
 
-    /* Try Wayland EGL first — required for NVIDIA on Wayland sessions.
-     * NVIDIA doesn't support headless EGL (GBM/Device Platform) in processes
-     * with an active Wayland session; it requires EGL_PLATFORM_WAYLAND_KHR. */
-    if (initEGL_Wayland(task)) {
-        return 1;
-    }
-
     /* Try render nodes — on multi-GPU systems, find one that works.
      * renderD128 may be AMD iGPU while renderD129 is NVIDIA dGPU. */
     static const char *renderNodes[] = {
@@ -1028,6 +1021,9 @@ static int initEGL(CreateTask *task) {
         task->gbmDevice = NULL;
 
         if (initEGL_NvidiaVendor(task)) {
+            return 1;
+        }
+        if (initEGL_Wayland(task)) {
             return 1;
         }
         if (initEGL_SharedContext(task)) {
