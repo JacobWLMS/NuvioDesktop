@@ -91,4 +91,11 @@ private fun configureDesktopChrome() {
     if (System.getProperty("os.name").contains("mac", ignoreCase = true)) {
         System.setProperty("apple.awt.application.appearance", MacosDarkAquaAppearance)
     }
+    if (System.getProperty("os.name").contains("linux", ignoreCase = true)) {
+        // Force Skia software rendering on Linux so that Skia doesn't hold an EGL context.
+        // This allows our player's EGL offscreen context (for GPU video rendering via VAAPI/nvdec)
+        // to call eglMakeCurrent without conflict. Compose UI performance remains good
+        // because the UI is lightweight (no 3D). Video decode is still GPU-accelerated.
+        System.setProperty("skia.renderApi", "SOFTWARE")
+    }
 }
