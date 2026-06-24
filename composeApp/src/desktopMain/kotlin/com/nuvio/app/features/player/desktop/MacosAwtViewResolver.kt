@@ -100,13 +100,16 @@ private object LinuxAwtViewResolver {
         val peer = componentPeerField.get(component)
             ?: error("AWT component peer is not ready for native playback.")
 
-        // On X11, the AWT peer (XComponentPeer / XCanvasPeer) exposes getWindow()
-        // which returns the X11 Window (XID) as a long.
-        val pointer = invokeLong(peer, "getWindow")
-        if (pointer == 0L) {
-            error("Linux AWT X11 window pointer was zero.")
+        // Try multiple method names — varies across JDK versions/vendors.
+        // XComponentPeer.getWindow() or XCanvasPeer.getContentWindow() or getWidget()
+        val methodNames = listOf("getWindow", "getContentWindow", "getWidget")
+        for (name in methodNames) {
+            val pointer = runCatching { invokeLong(peer, name) }.getOrNull()
+            if (pointer != null && pointer != 0L) {
+                return pointer
+            }
         }
-        return pointer
+        error("Linux AWT X11 window pointer could not be resolved. Peer=${peer.javaClass.name}, methods tried: $methodNames")
     }
 
     private fun findMethod(type: Class<*>, name: String): Method {
