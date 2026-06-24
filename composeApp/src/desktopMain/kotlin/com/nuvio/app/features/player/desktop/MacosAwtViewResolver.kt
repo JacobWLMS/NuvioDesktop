@@ -86,6 +86,9 @@ private object WindowsAwtViewResolver {
  * Linux X11: resolves the native X11 Window ID from AWT peer.
  * This allows mpv to render directly into the X11 window with vo=gpu-next,
  * bypassing the expensive CPU frame copy pipeline.
+ *
+ * Primary method: JAWT (Java AWT Native Interface) — stable, official API.
+ * Fallback: reflection on internal XBaseWindow.window field.
  */
 private object LinuxAwtViewResolver {
     private val componentPeerField: Field by lazy {
@@ -97,19 +100,54 @@ private object LinuxAwtViewResolver {
             error("GPU-direct wid mode is not supported on Wayland; use SW rendering fallback.")
         }
 
+        // Primary: JAWT — works on all JDK versions without --add-opens
+        val jawtResult = runCatching { NativePlayerBridge.getX11WindowId(component) }.getOrElse { e ->
+            System.err.println("[NUVIO_X11] JAWT failed: ${e.message}")
+            null
+        }
+        if (jawtResult != null && jawtResult != 0L) {
+            System.err.println("[NUVIO_X11] resolved via JAWT: 0x${jawtResult.toString(16)}")
+            return jawtResult
+        }
+
+        // Fallback: reflection on peer's internal 'window' field (XBaseWindow stores XID there)
         val peer = componentPeerField.get(component)
             ?: error("AWT component peer is not ready for native playback.")
 
-        // Try multiple method names — varies across JDK versions/vendors.
-        // XComponentPeer.getWindow() or XCanvasPeer.getContentWindow() or getWidget()
+        System.err.println("[NUVIO_X11] JAWT returned $jawtResult, trying field reflection on ${peer.javaClass.name}")
+
+        val fieldResult = runCatching { getWindowField(peer) }.getOrNull()
+        if (fieldResult != null && fieldResult != 0L) {
+            System.err.println("[NUVIO_X11] resolved via 'window' field: 0x${fieldResult.toString(16)}")
+            return fieldResult
+        }
+
+        // Last resort: try method-based approach
         val methodNames = listOf("getWindow", "getContentWindow", "getWidget")
         for (name in methodNames) {
             val pointer = runCatching { invokeLong(peer, name) }.getOrNull()
             if (pointer != null && pointer != 0L) {
+                System.err.println("[NUVIO_X11] resolved via method '$name': 0x${pointer.toString(16)}")
                 return pointer
             }
         }
-        error("Linux AWT X11 window pointer could not be resolved. Peer=${peer.javaClass.name}, methods tried: $methodNames")
+        error("Linux AWT X11 window pointer could not be resolved. " +
+            "JAWT returned ${jawtResult ?: "exception"}, " +
+            "Peer=${peer.javaClass.name}, methods tried: $methodNames")
+    }
+
+    /** Read the 'window' field from XBaseWindow hierarchy — holds the X11 Window (XID). */
+    private fun getWindowField(peer: Any): Long {
+        var clazz: Class<*>? = peer.javaClass
+        while (clazz != null) {
+            runCatching {
+                val field = clazz!!.getDeclaredField("window")
+                field.isAccessible = true
+                return (field.get(peer) as Number).toLong()
+            }
+            clazz = clazz.superclass
+        }
+        return 0L
     }
 
     private fun findMethod(type: Class<*>, name: String): Method {

@@ -100,6 +100,7 @@ internal object NativePlayerBridge {
     external fun videoHeight(handle: Long): Int
     external fun isWaylandSession(): Boolean
     external fun setProperty(handle: Long, name: String, value: String)
+    external fun getX11WindowId(component: java.awt.Component): Long
 
     val controlsPageUrl: String by lazy { controlsPageAssets.url }
     private val controlsPageAssets: ControlsPageAssets by lazy { exportControlsPageAssets() }
