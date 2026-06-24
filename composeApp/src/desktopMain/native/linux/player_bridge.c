@@ -192,6 +192,9 @@ typedef EGLBoolean (*PFNEGLQUERYDEVICESEXTPROC)(EGLint, void *, EGLint *);
 static int initEGL_DevicePlatform(CreateTask *task) {
     DBG("EGL: trying EGL_PLATFORM_DEVICE_EXT fallback\n");
 
+    /* Clear any stale EGL thread state (NVIDIA keeps per-thread state) */
+    eglReleaseThread();
+
     PFNEGLQUERYDEVICESEXTPROC eglQueryDevicesEXT =
         (PFNEGLQUERYDEVICESEXTPROC)(void*)eglGetProcAddress("eglQueryDevicesEXT");
     PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
@@ -221,6 +224,12 @@ static int initEGL_DevicePlatform(CreateTask *task) {
             continue;
         }
         DBG("EGL: Device[%d] initialized %d.%d\n", i, major, minor);
+
+        /* Log client extensions for diagnostics */
+        const char *exts = eglQueryString(task->eglDisplay, EGL_EXTENSIONS);
+        int hasSurfaceless = exts && strstr(exts, "EGL_KHR_surfaceless_context") != NULL;
+        int hasCreateCtx = exts && strstr(exts, "EGL_KHR_create_context") != NULL;
+        DBG("EGL: Device[%d] surfaceless=%d create_context=%d\n", i, hasSurfaceless, hasCreateCtx);
 
         /* Bind OpenGL (NVIDIA device platform supports full GL with pbuffer) */
         eglBindAPI(EGL_OPENGL_API);
@@ -274,16 +283,71 @@ static int initEGL_DevicePlatform(CreateTask *task) {
         EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
         task->eglSurface = eglCreatePbufferSurface(task->eglDisplay, config, pbufAttribs);
         if (task->eglSurface == EGL_NO_SURFACE) {
-            DBG("EGL: Device[%d] pbuffer failed, trying surfaceless\n", i);
+            DBG("EGL: Device[%d] pbuffer failed (err=0x%x)\n", i, eglGetError());
             task->eglSurface = EGL_NO_SURFACE;
+        } else {
+            DBG("EGL: Device[%d] pbuffer created OK\n", i);
         }
 
-        /* Verify MakeCurrent works */
+        /* Verify MakeCurrent works — try with pbuffer first, then surfaceless */
         EGLSurface testSurf = (task->eglSurface != EGL_NO_SURFACE) ? task->eglSurface : EGL_NO_SURFACE;
         if (!eglMakeCurrent(task->eglDisplay, testSurf, testSurf, task->eglContext)) {
-            DBG("EGL: Device[%d] eglMakeCurrent failed (err=0x%x)\n", i, eglGetError());
+            EGLint mkErr = eglGetError();
+            DBG("EGL: Device[%d] eglMakeCurrent failed (surface=%s, err=0x%x)\n",
+                i, testSurf != EGL_NO_SURFACE ? "pbuffer" : "surfaceless", mkErr);
+
+            /* If we had pbuffer and it failed, try surfaceless */
+            if (testSurf != EGL_NO_SURFACE) {
+                eglDestroySurface(task->eglDisplay, task->eglSurface);
+                task->eglSurface = EGL_NO_SURFACE;
+                if (eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext)) {
+                    DBG("EGL: Device[%d] surfaceless MakeCurrent OK\n", i);
+                    goto device_success;
+                }
+                DBG("EGL: Device[%d] surfaceless also failed (err=0x%x)\n", i, eglGetError());
+            }
+
+            /* Try switching to GLES API if we were using GL */
+            eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             eglDestroyContext(task->eglDisplay, task->eglContext);
-            if (task->eglSurface != EGL_NO_SURFACE) eglDestroySurface(task->eglDisplay, task->eglSurface);
+            task->eglContext = EGL_NO_CONTEXT;
+
+            DBG("EGL: Device[%d] retrying with GLES API\n", i);
+            eglBindAPI(EGL_OPENGL_ES_API);
+            EGLint glesRetryAttribs[] = {
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_NONE
+            };
+            EGLConfig glesConfig;
+            EGLint glesNumConfigs;
+            if (eglChooseConfig(task->eglDisplay, glesRetryAttribs, &glesConfig, 1, &glesNumConfigs) && glesNumConfigs > 0) {
+                EGLint glesCtxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+                task->eglContext = eglCreateContext(task->eglDisplay, glesConfig, EGL_NO_CONTEXT, glesCtxAttribs);
+                if (task->eglContext != EGL_NO_CONTEXT) {
+                    EGLint pb[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+                    task->eglSurface = eglCreatePbufferSurface(task->eglDisplay, glesConfig, pb);
+                    EGLSurface s = (task->eglSurface != EGL_NO_SURFACE) ? task->eglSurface : EGL_NO_SURFACE;
+                    if (eglMakeCurrent(task->eglDisplay, s, s, task->eglContext)) {
+                        DBG("EGL: Device[%d] GLES+pbuffer MakeCurrent OK\n", i);
+                        goto device_success;
+                    }
+                    /* Try surfaceless with GLES */
+                    if (task->eglSurface != EGL_NO_SURFACE) {
+                        eglDestroySurface(task->eglDisplay, task->eglSurface);
+                        task->eglSurface = EGL_NO_SURFACE;
+                    }
+                    if (eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext)) {
+                        DBG("EGL: Device[%d] GLES+surfaceless MakeCurrent OK\n", i);
+                        goto device_success;
+                    }
+                    DBG("EGL: Device[%d] GLES MakeCurrent also failed (err=0x%x)\n", i, eglGetError());
+                    eglDestroyContext(task->eglDisplay, task->eglContext);
+                    task->eglContext = EGL_NO_CONTEXT;
+                }
+            }
+
             eglTerminate(task->eglDisplay);
             task->eglDisplay = EGL_NO_DISPLAY;
             task->eglContext = EGL_NO_CONTEXT;
@@ -291,6 +355,7 @@ static int initEGL_DevicePlatform(CreateTask *task) {
             continue;
         }
 
+device_success:
         /* SUCCESS! Unbind — render thread will rebind */
         eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         DBG("EGL: Device Platform context created successfully (device=%d, surface=%s)\n",
@@ -303,6 +368,9 @@ static int initEGL_DevicePlatform(CreateTask *task) {
 }
 
 static int initEGL(CreateTask *task) {
+    /* Clear any stale EGL thread state from Skia/Compose */
+    eglReleaseThread();
+
     int origFd = open("/dev/dri/renderD128", O_RDWR);
     if (origFd < 0) {
         DBG("EGL: failed to open /dev/dri/renderD128\n");
