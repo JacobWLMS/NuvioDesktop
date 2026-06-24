@@ -21,6 +21,8 @@
 #include <GL/glext.h>
 #include <fcntl.h>
 #include <gbm.h>
+#include <wayland-client.h>
+#include <wayland-egl.h>
 
 /* ------------------------------------------------------------------ */
 /*  Debug logging                                                      */
@@ -142,6 +144,142 @@ typedef EGLDisplay (*PFNEGLGETPLATFORMDISPLAYEXTPROC)(EGLenum, void *, const EGL
 #ifndef EGL_EXT_device_enumeration
 typedef EGLBoolean (*PFNEGLQUERYDEVICESEXTPROC)(EGLint, void *, EGLint *);
 #endif
+
+#ifndef EGL_PLATFORM_WAYLAND_KHR
+#define EGL_PLATFORM_WAYLAND_KHR 0x31D8
+#endif
+
+/* ------------------------------------------------------------------ */
+/*  EGL via Wayland display (required for NVIDIA on Wayland)           */
+/* ------------------------------------------------------------------ */
+static int initEGL_Wayland(CreateTask *task) {
+    const char *waylandDisplay = getenv("WAYLAND_DISPLAY");
+    if (!waylandDisplay || waylandDisplay[0] == '\0') {
+        const char *sessionType = getenv("XDG_SESSION_TYPE");
+        if (!sessionType || !strstr(sessionType, "wayland")) {
+            DBG("EGL: not a Wayland session, skipping Wayland EGL\n");
+            return 0;
+        }
+    }
+
+    struct wl_display *wl = wl_display_connect(NULL);
+    if (!wl) {
+        DBG("EGL: wl_display_connect failed\n");
+        return 0;
+    }
+    DBG("EGL: connected to Wayland display\n");
+
+    PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+
+    EGLDisplay display = EGL_NO_DISPLAY;
+    if (eglGetPlatformDisplayEXT) {
+        display = eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_KHR, wl, NULL);
+    }
+    if (display == EGL_NO_DISPLAY) {
+        display = eglGetDisplay((EGLNativeDisplayType)wl);
+    }
+    if (display == EGL_NO_DISPLAY) {
+        DBG("EGL: Wayland EGL display failed\n");
+        wl_display_disconnect(wl);
+        return 0;
+    }
+
+    EGLint major, minor;
+    if (!eglInitialize(display, &major, &minor)) {
+        DBG("EGL: Wayland eglInitialize failed (err=0x%x)\n", eglGetError());
+        wl_display_disconnect(wl);
+        return 0;
+    }
+    DBG("EGL: Wayland EGL initialized %d.%d\n", major, minor);
+
+    eglBindAPI(EGL_OPENGL_API);
+
+    EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs;
+    int useGLES = 0;
+    if (!eglChooseConfig(display, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+        /* Try without PBUFFER requirement — Wayland may only support window surfaces */
+        EGLint configAttribs2[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(display, configAttribs2, &config, 1, &numConfigs) || numConfigs == 0) {
+            DBG("EGL: Wayland GL config failed, trying GLES\n");
+            eglBindAPI(EGL_OPENGL_ES_API);
+            EGLint glesAttribs[] = {
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_NONE
+            };
+            if (!eglChooseConfig(display, glesAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+                DBG("EGL: Wayland no suitable config\n");
+                eglTerminate(display);
+                wl_display_disconnect(wl);
+                return 0;
+            }
+            useGLES = 1;
+        }
+    }
+
+    EGLContext ctx = EGL_NO_CONTEXT;
+    if (!useGLES) {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                                EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                EGL_NONE };
+        ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            EGLint ctxAttribs2[] = { EGL_NONE };
+            ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs2);
+        }
+    } else {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+        ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+    }
+    if (ctx == EGL_NO_CONTEXT) {
+        DBG("EGL: Wayland context creation failed (err=0x%x)\n", eglGetError());
+        eglTerminate(display);
+        wl_display_disconnect(wl);
+        return 0;
+    }
+
+    /* Try pbuffer surface first */
+    EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    EGLSurface surface = eglCreatePbufferSurface(display, config, pbufAttribs);
+    if (surface == EGL_NO_SURFACE) {
+        DBG("EGL: Wayland pbuffer failed, trying surfaceless\n");
+        surface = EGL_NO_SURFACE;
+    }
+
+    /* Test MakeCurrent */
+    EGLSurface testSurf = (surface != EGL_NO_SURFACE) ? surface : EGL_NO_SURFACE;
+    if (!eglMakeCurrent(display, testSurf, testSurf, ctx)) {
+        DBG("EGL: Wayland eglMakeCurrent failed (err=0x%x)\n", eglGetError());
+        eglDestroyContext(display, ctx);
+        if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+        eglTerminate(display);
+        wl_display_disconnect(wl);
+        return 0;
+    }
+
+    /* Success! */
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    task->eglDisplay = display;
+    task->eglContext = ctx;
+    task->eglSurface = surface;
+    DBG("EGL: Wayland EGL context ready (display=%p, surface=%s, api=%s)\n",
+        (void*)display, surface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless",
+        useGLES ? "GLES" : "GL");
+    /* NOTE: wl_display intentionally leaked — needed for EGL display lifetime */
+    return 1;
+}
 
 /* ------------------------------------------------------------------ */
 /*  EGL via NVIDIA vendor library (bypasses Mesa dispatcher)           */
@@ -736,6 +874,13 @@ device_success:
 static int initEGL(CreateTask *task) {
     /* Clear any stale EGL thread state from Skia/Compose */
     eglReleaseThread();
+
+    /* Try Wayland EGL first — required for NVIDIA on Wayland sessions.
+     * NVIDIA doesn't support headless EGL (GBM/Device Platform) in processes
+     * with an active Wayland session; it requires EGL_PLATFORM_WAYLAND_KHR. */
+    if (initEGL_Wayland(task)) {
+        return 1;
+    }
 
     /* Try render nodes — on multi-GPU systems, find one that works.
      * renderD128 may be AMD iGPU while renderD129 is NVIDIA dGPU. */
