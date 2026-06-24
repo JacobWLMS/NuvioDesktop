@@ -140,7 +140,7 @@ private fun LinuxWaylandPlayerSurface(
     val latestOnPlayerControlsScrubFinished = rememberUpdatedState(onPlayerControlsScrubFinished)
     val latestOnError = rememberUpdatedState(onError)
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, sourceUrl) {
         onControllerReady(controller)
     }
 
@@ -312,7 +312,7 @@ private fun NativePlayerSurface(
     val decoderPriority = playerSettings.decoderPriority
     val nvidiaRtxSuperResolutionEnabled = playerSettings.nvidiaRtxSuperResolutionEnabled
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, sourceUrl) {
         onControllerReady(controller)
     }
 
