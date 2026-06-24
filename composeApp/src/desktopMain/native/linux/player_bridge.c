@@ -274,9 +274,24 @@ static int initEGL_Wayland(CreateTask *task) {
     task->eglDisplay = display;
     task->eglContext = ctx;
     task->eglSurface = surface;
-    DBG("EGL: Wayland EGL context ready (display=%p, surface=%s, api=%s)\n",
+
+    /* Open a DRM render node for VAAPI/nvdec interop (mpv DRM_DISPLAY_V2).
+     * The EGL display is Wayland-based but mpv still needs a DRM fd for hw decode. */
+    if (task->gbmFd < 0) {
+        static const char *drmNodes[] = {"/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130", NULL};
+        for (int i = 0; drmNodes[i]; i++) {
+            int fd = open(drmNodes[i], O_RDWR);
+            if (fd >= 0) {
+                task->gbmFd = fd;
+                DBG("EGL: Wayland path opened DRM node %s for hw interop\n", drmNodes[i]);
+                break;
+            }
+        }
+    }
+
+    DBG("EGL: Wayland EGL context ready (display=%p, surface=%s, api=%s, drmFd=%d)\n",
         (void*)display, surface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless",
-        useGLES ? "GLES" : "GL");
+        useGLES ? "GLES" : "GL", task->gbmFd);
     /* NOTE: wl_display intentionally leaked — needed for EGL display lifetime */
     return 1;
 }
