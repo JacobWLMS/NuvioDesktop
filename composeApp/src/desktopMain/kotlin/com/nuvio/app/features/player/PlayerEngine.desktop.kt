@@ -32,6 +32,7 @@ import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
 import com.nuvio.app.features.player.desktop.NativePlayerHost
 import com.nuvio.app.features.player.desktop.LinuxPlayerHost
+import com.nuvio.app.features.player.desktop.NativePlayerBridge
 import com.nuvio.app.features.player.desktop.toggleDesktopAppFullscreen
 import java.awt.AWTEvent
 import java.awt.Toolkit
@@ -136,6 +137,7 @@ private fun LinuxPlayerSurface(
     var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
     var frameTick by remember { mutableIntStateOf(0) }
     var disposed by remember { mutableStateOf(false) }
+    var loggedCanvasEglContext by remember { mutableStateOf(false) }
 
     val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
     val latestOnPlayerControlsEvent = rememberUpdatedState(onPlayerControlsEvent)
@@ -260,6 +262,10 @@ private fun LinuxPlayerSurface(
         ) {
             frameTick // read to trigger recomposition
             if (!disposed) {
+                if (!loggedCanvasEglContext && host.nativeHandle != 0L) {
+                    NativePlayerBridge.debugCurrentEglContext(host.nativeHandle, "compose-canvas")
+                    loggedCanvasEglContext = true
+                }
                 val skiaImage = host.latestImage
                 if (skiaImage != null && !skiaImage.isClosed) {
                     val canvas = drawContext.canvas.nativeCanvas

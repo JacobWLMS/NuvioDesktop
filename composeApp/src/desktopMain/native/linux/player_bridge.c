@@ -101,6 +101,7 @@ typedef struct {
 
     /* Captured from JNI thread for shared context fallback (NVIDIA) */
     EGLDisplay skiaDisplay;
+    int loggedCurrentContextProbe;
 } CreateTask;
 
 static void callEventSink(JNIEnv *env, JavaVM *jvm,
@@ -2197,4 +2198,31 @@ JNIEXPORT jboolean JNICALL Java_com_nuvio_app_features_player_desktop_NativePlay
     (*env)->ReleaseByteArrayElements(env, dstBytes, dst, 0);
     pthread_mutex_unlock(&task->frameMutex);
     return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_debugCurrentEglContext(
+    JNIEnv *env, jobject thiz, jlong handle, jstring tag) {
+    (void)thiz;
+    CreateTask *task = getTask(handle);
+    if (!task || task->loggedCurrentContextProbe) return;
+    task->loggedCurrentContextProbe = 1;
+
+    const char *tagChars = tag ? (*env)->GetStringUTFChars(env, tag, NULL) : NULL;
+    EGLDisplay display = eglGetCurrentDisplay();
+    EGLContext context = eglGetCurrentContext();
+    EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface read = eglGetCurrentSurface(EGL_READ);
+    const char *renderer = context != EGL_NO_CONTEXT ? (const char *)glGetString(GL_RENDERER) : NULL;
+    const char *version = context != EGL_NO_CONTEXT ? (const char *)glGetString(GL_VERSION) : NULL;
+    DBG("current EGL probe (%s): display=%p context=%p draw=%p read=%p GL=%s renderer=%s\n",
+        tagChars ? tagChars : "untagged",
+        (void *)display,
+        (void *)context,
+        (void *)draw,
+        (void *)read,
+        version ? version : "null",
+        renderer ? renderer : "null");
+    if (tagChars) {
+        (*env)->ReleaseStringUTFChars(env, tag, tagChars);
+    }
 }

@@ -95,6 +95,7 @@ internal object NativePlayerBridge {
     // Linux-specific native methods
     external fun renderFrame(handle: Long, dstPixels: IntArray, dstW: Int, dstH: Int): Boolean
     external fun renderFrameBytes(handle: Long, dstBytes: ByteArray, dstW: Int, dstH: Int): Boolean
+    external fun debugCurrentEglContext(handle: Long, tag: String)
     external fun resizeNativeView(handle: Long, width: Int, height: Int)
     external fun videoWidth(handle: Long): Int
     external fun videoHeight(handle: Long): Int
