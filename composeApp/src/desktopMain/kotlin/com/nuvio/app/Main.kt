@@ -91,4 +91,28 @@ private fun configureDesktopChrome() {
     if (System.getProperty("os.name").contains("mac", ignoreCase = true)) {
         System.setProperty("apple.awt.application.appearance", MacosDarkAquaAppearance)
     }
+    if (System.getProperty("os.name").contains("linux", ignoreCase = true)) {
+        // Force Skiko (the Compose UI renderer) to render in software on Linux.
+        //
+        // The desktop video player runs mpv in an offscreen EGL context on its own
+        // render thread (see desktopMain/native/linux/player_bridge.c). NVIDIA's EGL
+        // driver refuses to make-current a second, independent context in a process
+        // that already holds Skiko's OpenGL context — every offscreen path (GBM,
+        // EGL Device Platform, vendor lib, pbuffer) fails identically with
+        // EGL_NOT_INITIALIZED (0x3000). With Skiko in software mode the player's
+        // context is the only EGL context in the process, so eglMakeCurrent succeeds.
+        //
+        // This is effectively free for the video pipeline: Linux frames are already
+        // read back to CPU (glReadPixels) and composited as raster Skia images, and
+        // video decode stays GPU-accelerated via hwdec=auto-copy (nvdec / VAAPI).
+        // Only the lightweight UI moves to CPU compositing.
+        //
+        // The property is "skiko.renderApi" (Skiko), NOT "skia.renderApi" — an earlier
+        // attempt used the wrong key and silently had no effect. Skiko also honours the
+        // SKIKO_RENDER_API env var, which takes precedence, so we don't clobber an
+        // explicit override.
+        if (System.getProperty("skiko.renderApi") == null) {
+            System.setProperty("skiko.renderApi", "SOFTWARE")
+        }
+    }
 }

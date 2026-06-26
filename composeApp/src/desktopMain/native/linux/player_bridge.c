@@ -890,10 +890,11 @@ static int initEGL(CreateTask *task) {
     /* Clear any stale EGL thread state from Skia/Compose */
     eglReleaseThread();
 
-    /* Try Wayland EGL first (test) */
-    if (initEGL_Wayland(task)) {
-        return 1;
-    }
+    /* Try GBM render nodes first — this is the well-tested path (Intel/AMD/Mesa)
+     * and the one that carries a DRM fd for VAAPI/nvdec zero-copy interop. With
+     * Skiko forced to software rendering (see Main.kt) the offscreen GBM context
+     * now succeeds on NVIDIA too. Wayland EGL stays in the fallback chain below,
+     * so it's only reached if GBM genuinely can't make-current. */
 
     /* Try render nodes — on multi-GPU systems, find one that works.
      * renderD128 may be AMD iGPU while renderD129 is NVIDIA dGPU. */
