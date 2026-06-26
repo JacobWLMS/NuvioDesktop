@@ -1028,19 +1028,30 @@ static int initEGL(CreateTask *task) {
     EGLSurface testSurf = (task->eglSurface != EGL_NO_SURFACE) ? task->eglSurface : EGL_NO_SURFACE;
     if (!eglMakeCurrent(task->eglDisplay, testSurf, testSurf, task->eglContext)) {
         EGLint err = eglGetError();
-        DBG("EGL: GBM eglMakeCurrent pre-check failed (err=0x%x), trying NVIDIA vendor lib\n", err);
-        /* GBM path doesn't work (NVIDIA). Try NVIDIA vendor library directly. */
+        DBG("EGL: GBM eglMakeCurrent pre-check failed (err=0x%x) — almost always NVIDIA\n", err);
+        /* GBM make-current failed. This is the NVIDIA case. */
         eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(task->eglDisplay, task->eglContext);
         if (task->eglSurface != EGL_NO_SURFACE) eglDestroySurface(task->eglDisplay, task->eglSurface);
         eglTerminate(task->eglDisplay);
         gbm_device_destroy(task->gbmDevice);
-        /* Keep gbmFd open for DRM params */
+        /* Keep gbmFd open for DRM params (still valid for VAAPI/nvdec interop) */
         task->eglDisplay = EGL_NO_DISPLAY;
         task->eglContext = EGL_NO_CONTEXT;
         task->eglSurface = EGL_NO_SURFACE;
         task->gbmDevice = NULL;
 
+        /* Try EGL_PLATFORM_DEVICE_EXT (headless) FIRST. It talks straight to the
+         * GPU device and never touches X11/Wayland/XWayland, so it sidesteps the
+         * documented NVIDIA-under-XWayland EGL breakage. This is NVIDIA's own
+         * recommended offscreen path. It was the project's original approach but
+         * was abandoned while Skiko still held a competing EGL context (the
+         * skia.renderApi typo meant software mode never actually engaged); with
+         * Skiko now forced to software (see Main.kt) it should make-current cleanly. */
+        if (initEGL_DevicePlatform(task)) {
+            return 1;
+        }
+        /* Then the remaining NVIDIA-specific paths, then windowing-based EGL. */
         if (initEGL_NvidiaVendor(task)) {
             return 1;
         }
@@ -1048,9 +1059,6 @@ static int initEGL(CreateTask *task) {
             return 1;
         }
         if (initEGL_SharedContext(task)) {
-            return 1;
-        }
-        if (initEGL_DevicePlatform(task)) {
             return 1;
         }
         /* All fallbacks failed for this node — try next */
