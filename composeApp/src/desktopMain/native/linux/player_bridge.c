@@ -19,6 +19,7 @@
 #define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
 #include <GL/glext.h>
+#include <GL/glx.h>
 #include <fcntl.h>
 #include <gbm.h>
 
@@ -39,13 +40,27 @@ static void on_load(void) {
 /* ------------------------------------------------------------------ */
 /*  Cached GL offscreen instance (reused between player sessions)      */
 /* ------------------------------------------------------------------ */
+/* GL context backend for the offscreen player (gpuMode 2).
+ *
+ * EGL/GBM is the original path; it carries a DRM fd for VAAPI/nvdec zero-copy interop
+ * (good on Intel/AMD/Mesa). GLX is used on NVIDIA proprietary: Skiko renders the UI with a
+ * GLX context, and NVIDIA refuses a *second EGL* context in the same process — but a second
+ * *GLX* context coexists fine. GLX has no dmabuf zero-copy import, which is moot here because
+ * the player already reads frames back via glReadPixels. */
+#define GL_BACKEND_EGL 0
+#define GL_BACKEND_GLX 1
+
 static pthread_mutex_t glCacheMutex = PTHREAD_MUTEX_INITIALIZER;
 static struct {
     int valid;
+    int glBackend;
     int gbmFd;
     struct gbm_device *gbmDevice;
     EGLDisplay eglDisplay;
     EGLContext eglContext;
+    Display *glxDisplay;
+    GLXContext glxContext;
+    GLXPbuffer glxPbuffer;
     mpv_handle *mpv;
     mpv_render_context *renderCtx;
     GLuint fbo;
@@ -53,6 +68,20 @@ static struct {
     int fboW;
     int fboH;
 } glCache = {0};
+
+/* Decide GL backend: env override NUVIO_DESKTOP_PLAYER_GL=glx|egl wins (lets us test GLX on
+ * non-NVIDIA later); otherwise auto — NVIDIA proprietary => GLX, everything else => EGL/GBM. */
+static int chooseGlBackend(void) {
+    const char *force = getenv("NUVIO_DESKTOP_PLAYER_GL");
+    if (force && *force) {
+        if (strcasecmp(force, "glx") == 0) return GL_BACKEND_GLX;
+        if (strcasecmp(force, "egl") == 0) return GL_BACKEND_EGL;
+    }
+    if (access("/dev/nvidiactl", F_OK) == 0 || access("/proc/driver/nvidia/version", F_OK) == 0) {
+        return GL_BACKEND_GLX;
+    }
+    return GL_BACKEND_EGL;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Per-instance state                                                 */
@@ -87,11 +116,16 @@ typedef struct {
     volatile int frameSignal;
 
     /* GL offscreen mode (gpuMode 2) */
+    int glBackend;            /* GL_BACKEND_EGL or GL_BACKEND_GLX */
     int gbmFd;
     struct gbm_device *gbmDevice;
     EGLDisplay eglDisplay;
     EGLContext eglContext;
     EGLSurface eglSurface;
+    /* GLX backend state (used when glBackend == GL_BACKEND_GLX) */
+    Display *glxDisplay;
+    GLXContext glxContext;
+    GLXPbuffer glxPbuffer;
     GLuint fbo;
     GLuint fboTex;
     int fboW;
@@ -1013,8 +1047,89 @@ static void destroyEGL(CreateTask *task) {
 }
 
 static void *glGetProcAddressWrapper(void *ctx, const char *name) {
-    (void)ctx;
+    CreateTask *task = (CreateTask *)ctx;
+    if (task && task->glBackend == GL_BACKEND_GLX) {
+        return (void *)glXGetProcAddressARB((const GLubyte *)name);
+    }
     return (void *)eglGetProcAddress(name);
+}
+
+static void mpvWakeupCallback(void *data); /* defined below */
+
+/* ------------------------------------------------------------------ */
+/*  GLX offscreen context (NVIDIA: coexists with Skiko's GLX context)  */
+/* ------------------------------------------------------------------ */
+static int initGLX(CreateTask *task) {
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        DBG("GLX: XOpenDisplay(NULL) failed (no X/XWayland display)\n");
+        return 0;
+    }
+    int screen = DefaultScreen(dpy);
+    int fbAttribs[] = {
+        GLX_DRAWABLE_TYPE, GLX_PBUFFER_BIT,
+        GLX_RENDER_TYPE, GLX_RGBA_BIT,
+        GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, GLX_ALPHA_SIZE, 8,
+        GLX_DOUBLEBUFFER, False,
+        None
+    };
+    int n = 0;
+    GLXFBConfig *cfgs = glXChooseFBConfig(dpy, screen, fbAttribs, &n);
+    if (!cfgs || n == 0) {
+        DBG("GLX: glXChooseFBConfig found no pbuffer-capable config\n");
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    GLXContext ctx = glXCreateNewContext(dpy, cfgs[0], GLX_RGBA_TYPE, NULL, True /*direct*/);
+    if (!ctx) {
+        DBG("GLX: glXCreateNewContext failed\n");
+        XFree(cfgs);
+        XCloseDisplay(dpy);
+        return 0;
+    }
+    int pbAttribs[] = { GLX_PBUFFER_WIDTH, 16, GLX_PBUFFER_HEIGHT, 16, None };
+    GLXPbuffer pbuf = glXCreatePbuffer(dpy, cfgs[0], pbAttribs);
+    XFree(cfgs);
+
+    task->glxDisplay = dpy;
+    task->glxContext = ctx;
+    task->glxPbuffer = pbuf;
+    task->gbmFd = -1;   /* no DRM fd in the GLX path */
+    DBG("GLX: initialized (ctx=%p direct=%d)\n", (void *)ctx, glXIsDirect(dpy, ctx));
+    return 1;
+}
+
+/* Make the player's offscreen GL context current on the calling (render) thread. */
+static int glMakeCurrentRender(CreateTask *task) {
+    if (task->glBackend == GL_BACKEND_GLX) {
+        return glXMakeCurrent(task->glxDisplay, task->glxPbuffer, task->glxContext) ? 1 : 0;
+    }
+    return eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext) ? 1 : 0;
+}
+
+/* Release the player's offscreen GL context from the calling thread. */
+static void glReleaseCurrentRender(CreateTask *task) {
+    if (task->glBackend == GL_BACKEND_GLX) {
+        if (task->glxDisplay) glXMakeCurrent(task->glxDisplay, None, NULL);
+    } else if (task->eglDisplay != EGL_NO_DISPLAY) {
+        eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+}
+
+/* Fall back to mpv's software render API (gpuMode 0) when GL init fails. */
+static void createSWRenderContext(CreateTask *task) {
+    task->gpuMode = 0;
+    int adv = 1;
+    mpv_render_param sw_params[] = {
+        {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_SW},
+        {MPV_RENDER_PARAM_ADVANCED_CONTROL, &adv},
+        {0}
+    };
+    mpv_render_context_create(&task->renderCtx, task->mpv, sw_params);
+    if (task->renderCtx) {
+        mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
+        mpv_set_property_string(task->mpv, "hwdec", "auto-copy");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1037,8 +1152,10 @@ static void renderFrameGL(CreateTask *task) {
         h = (int)vh;
     }
 
-    if (!eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext)) {
-        DBG("renderFrameGL: eglMakeCurrent failed (error=0x%x)\n", eglGetError());
+    if (!glMakeCurrentRender(task)) {
+        DBG("renderFrameGL: makeCurrent failed (backend=%s, egl err=0x%x)\n",
+            task->glBackend == GL_BACKEND_GLX ? "glx" : "egl",
+            task->glBackend == GL_BACKEND_GLX ? 0 : eglGetError());
         return;
     }
     ensureFBO(task, w, h);
@@ -1129,7 +1246,50 @@ static void mpvWakeupCallback(void *data) {
 static void *renderThreadFunc(void *data) {
     CreateTask *task = (CreateTask *)data;
 
-    /* If gpuMode==2, create GL render context here where we own the EGL context.
+    /* For gpuMode==2 the GL context is created + made current on THIS render thread (NVIDIA
+     * requires same-thread create+MakeCurrent). Backend is GLX on NVIDIA, EGL/GBM otherwise. */
+    if (task->gpuMode == 2 && task->glBackend == GL_BACKEND_GLX && !task->renderCtx) {
+        /* GLX path (NVIDIA): a 2nd GLX context coexists with Skiko's GLX context, unlike a 2nd
+         * EGL context which NVIDIA refuses. Create + make-current on this render thread. */
+        if (!task->glxContext && !initGLX(task)) {
+            DBG("render thread: initGLX FAILED, falling back to SW\n");
+            createSWRenderContext(task);
+            goto render_loop;
+        }
+        if (!glXMakeCurrent(task->glxDisplay, task->glxPbuffer, task->glxContext)) {
+            DBG("render thread: glXMakeCurrent FAILED, falling back to SW\n");
+            createSWRenderContext(task);
+            goto render_loop;
+        }
+        {
+            const char *glVersion = (const char *)glGetString(GL_VERSION);
+            const char *glRenderer = (const char *)glGetString(GL_RENDERER);
+            DBG("render thread: GLX current GL=%s renderer=%s\n",
+                glVersion ? glVersion : "null", glRenderer ? glRenderer : "null");
+        }
+        mpv_opengl_init_params gl_init = {
+            .get_proc_address = glGetProcAddressWrapper,
+            .get_proc_address_ctx = task,
+        };
+        int advanced = 1;
+        mpv_render_param render_params[] = {
+            {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_OPENGL},
+            {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl_init},
+            {MPV_RENDER_PARAM_ADVANCED_CONTROL, &advanced},
+            {0}
+        };
+        if (mpv_render_context_create(&task->renderCtx, task->mpv, render_params) < 0) {
+            DBG("render thread: GLX mpv_render_context_create FAILED, falling back to SW\n");
+            glXMakeCurrent(task->glxDisplay, None, NULL);
+            createSWRenderContext(task);
+            goto render_loop;
+        }
+        mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
+        DBG("render thread: GLX render context created successfully (gpuMode=2)\n");
+        goto render_loop;
+    }
+
+    /* If gpuMode==2 (EGL/GBM backend), create GL render context here where we own the EGL context.
      * This allows mpv to see eglGetCurrentDisplay() and init VAAPI interop. */
     if (task->gpuMode == 2 && !task->renderCtx) {
         /* Init EGL on this thread if not cached (NVIDIA requires same-thread create+MakeCurrent) */
@@ -1242,10 +1402,11 @@ gl_create_failed:
             }
             }
     } else if (task->gpuMode == 2 && task->renderCtx) {
-        /* Cached path: render context already exists, just activate EGL */
-        eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext);
+        /* Cached path: render context already exists, just activate the GL context */
+        glMakeCurrentRender(task);
         mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
-        DBG("render thread: reusing cached GL context\n");
+        DBG("render thread: reusing cached GL context (backend=%s)\n",
+            task->glBackend == GL_BACKEND_GLX ? "glx" : "egl");
     }
 
 render_loop:
@@ -1280,9 +1441,9 @@ render_loop:
         }
     }
 
-    /* Unbind EGL context from render thread */
-    if (task->gpuMode == 2 && task->eglDisplay != EGL_NO_DISPLAY) {
-        eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    /* Unbind the GL context from the render thread */
+    if (task->gpuMode == 2) {
+        glReleaseCurrentRender(task);
     }
 
     return NULL;
@@ -1481,10 +1642,14 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
     pthread_mutex_lock(&glCacheMutex);
     if (glCache.valid) {
         DBG("create: reusing cached GL instance\n");
+        task->glBackend = glCache.glBackend;
         task->gbmFd = glCache.gbmFd;
         task->gbmDevice = glCache.gbmDevice;
         task->eglDisplay = glCache.eglDisplay;
         task->eglContext = glCache.eglContext;
+        task->glxDisplay = glCache.glxDisplay;
+        task->glxContext = glCache.glxContext;
+        task->glxPbuffer = glCache.glxPbuffer;
         task->fbo = glCache.fbo;
         task->fboTex = glCache.fboTex;
         task->fboW = glCache.fboW;
@@ -1499,15 +1664,19 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
         glCache.renderCtx = NULL;
         pthread_mutex_unlock(&glCacheMutex);
         task->gpuMode = 2;
-        DBG("create: cached GL instance restored\n");
+        DBG("create: cached GL instance restored (backend=%s)\n",
+            task->glBackend == GL_BACKEND_GLX ? "glx" : "egl");
     } else {
         pthread_mutex_unlock(&glCacheMutex);
-        /* Defer EGL init to render thread — NVIDIA GBM/EGL doesn't support
-         * context creation on one thread + MakeCurrent on another. */
+        /* Defer GL init to the render thread — NVIDIA requires context creation +
+         * MakeCurrent on the same thread (both EGL and GLX). Backend: NVIDIA => GLX,
+         * else EGL/GBM (GLX avoids the EGL-vs-Skiko-GLX coexistence failure on NVIDIA). */
+        task->glBackend = chooseGlBackend();
         task->gpuMode = 2;
         mpv_set_option_string(task->mpv, "vo", "libmpv");
         mpv_set_option_string(task->mpv, "gpu-api", "opengl");
-        DBG("create: offscreen GL mode, EGL deferred to render thread\n");
+        DBG("create: offscreen GL mode (backend=%s), GL init deferred to render thread\n",
+            task->glBackend == GL_BACKEND_GLX ? "glx" : "egl");
     }
 
     int reusingCachedMpv = (task->gpuMode == 2 && task->renderCtx != NULL);
@@ -1697,10 +1866,14 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
         /* Cache for reuse — do NOT free mpv/renderCtx (crashes Gallium) */
         pthread_mutex_lock(&glCacheMutex);
         glCache.valid = 1;
+        glCache.glBackend = task->glBackend;
         glCache.gbmFd = task->gbmFd;
         glCache.gbmDevice = task->gbmDevice;
         glCache.eglDisplay = task->eglDisplay;
         glCache.eglContext = task->eglContext;
+        glCache.glxDisplay = task->glxDisplay;
+        glCache.glxContext = task->glxContext;
+        glCache.glxPbuffer = task->glxPbuffer;
         glCache.mpv = task->mpv;
         glCache.renderCtx = task->renderCtx;
         glCache.fbo = task->fbo;
@@ -1713,7 +1886,11 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
         task->mpv = NULL;
         task->eglDisplay = EGL_NO_DISPLAY;
         task->eglContext = EGL_NO_CONTEXT;
-        DBG("dispose: GL instance cached for reuse\n");
+        task->glxDisplay = NULL;
+        task->glxContext = NULL;
+        task->glxPbuffer = 0;
+        DBG("dispose: GL instance cached for reuse (backend=%s)\n",
+            task->glBackend == GL_BACKEND_GLX ? "glx" : "egl");
     } else {
         if (task->mpv) mpv_wakeup(task->mpv);
         if (task->renderThread) pthread_join(task->renderThread, NULL);
